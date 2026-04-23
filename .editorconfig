@@ -1,0 +1,5 @@
+root = true
+
+# 适用于所有文件
+[*]
+charset = utf-8                    # 强制使用 UTF-8 编码（无 BOM）
