@@ -17,11 +17,11 @@ extern "C" {
 #include <videoEncoder.h>
 #include <videoDecoder.h>
 //tensorRT
-#include <NvInfer.h>
-#include <fstream>
-#include <cuda_runtime.h>
+// #include <NvInfer.h>
+// #include <fstream>
+// #include <cuda_runtime.h>
 
-using namespace nvinfer1;
+// using namespace nvinfer1;
 
 /**
  * 列出当前 FFmpeg 库中所有的解码器
@@ -321,45 +321,48 @@ void FrameToPaddedRGBVector(AVFrame* frame, std::vector<float>& out_data, int pa
         dest_data, dest_linesize);
     sws_freeContext(sws_ctx);
 
-    // 7. 创建填充后的图像（pad_h x pad_w，黑色背景）
-    cv::Mat padded_frame(pad_h, pad_w, CV_8UC3, cv::Scalar(0, 0, 0));
+    // 创建填充后的图像（pad_h x pad_w，黑色背景）
+    //cv::Mat padded_frame(pad_h, pad_w, CV_8UC3, cv::Scalar(0, 0, 0));
+    //rgb_frame.copyTo(padded_frame(cv::Rect(0, 0, src_w, src_h)));
+    // 优化：创建填充黑图，然后将原图拷贝到黑图左上角
+    //Padding (使用 OpenCV copyMakeBorder，比手动创建 Mat + copyTo 更快且内存连续)
+    cv::Mat padded_frame;
+    cv::copyMakeBorder(rgb_frame, padded_frame, 0, pad_h - src_h, 0, pad_w - src_w, 
+                       cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
 
+    // 调整 out_data 大小并填充数据 (CHW, float [0,1])
+    // out_data.resize(3 * pad_h * pad_w);
+    // for (int h = 0; h < pad_h; ++h) {
+    //     for (int w = 0; w < pad_w; ++w) {
+    //         cv::Vec3b pixel = padded_frame.at<cv::Vec3b>(h, w);
+    //         float r = pixel[0] / 255.0f;
+    //         float g = pixel[1] / 255.0f;
+    //         float b = pixel[2] / 255.0f;
 
-    rgb_frame.copyTo(padded_frame(cv::Rect(0, 0, src_w, src_h)));
-
-    // 验证到处的图片可知，padded_frame 中保存的是 RGB 数据
-    // static int save_count = 0;
-    // std::string filename = "padded_frame_" + std::to_string(save_count++) + ".png";
-    // cv::cvtColor(padded_frame, padded_frame, cv::COLOR_RGB2BGR);
-    // if (!cv::imwrite(filename, padded_frame)) {
-    //     std::cerr << "Warning: Could not save padded frame to " << filename << std::endl;
+    //         // CHW 索引
+    //         out_data[(0 * pad_h + h) * pad_w + w] = r;
+    //         out_data[(1 * pad_h + h) * pad_w + w] = g;
+    //         out_data[(2 * pad_h + h) * pad_w + w] = b;
+    //     }
     // }
+    // 优化： Normalize & Convert to CHW Float (关键优化点)
+    // 避免逐像素循环，使用 OpenCV 批量操作
+    out_data.resize(size_t(3) * pad_h * pad_w);
+    float* dst = out_data.data();
 
-    // 8. 调整 out_data 大小并填充数据 (CHW, float [0,1])
-    out_data.resize(3 * pad_h * pad_w);
-    for (int h = 0; h < pad_h; ++h) {
-        for (int w = 0; w < pad_w; ++w) {
-            cv::Vec3b pixel = padded_frame.at<cv::Vec3b>(h, w);
-            // float r = pixel[2] / 255.0f;
-            // float g = pixel[1] / 255.0f;
-            // float b = pixel[0] / 255.0f;
-            float r = pixel[0] / 255.0f;
-            float g = pixel[1] / 255.0f;
-            float b = pixel[2] / 255.0f;
+    const size_t channel_size = size_t(pad_h) * pad_w;
+    cv::Mat fp32;
+    padded_frame.convertTo(fp32, CV_32F, 1.0f / 255.0f);
 
-            // CHW 索引
-            out_data[(0 * pad_h + h) * pad_w + w] = r;
-            out_data[(1 * pad_h + h) * pad_w + w] = g;
-            out_data[(2 * pad_h + h) * pad_w + w] = b;
+    for (int y = 0; y < pad_h; y++) {
+        const cv::Vec3f* ptr = fp32.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < pad_w; x++) {
+            auto pix = ptr[x];
+            dst[channel_size * 0 + y * pad_w + x] = pix[0]; // R
+            dst[channel_size * 1 + y * pad_w + x] = pix[1]; // G
+            dst[channel_size * 2 + y * pad_w + x] = pix[2]; // B
         }
     }
-
-    // static int debug_count = 0;
-    // if (debug_count < 5) { // 只保存前5张，避免磁盘写满
-    //     std::string debug_filename = "debug_out_data_" + std::to_string(debug_count++) + ".png";
-    //     std::filesystem::create_directories("out");
-    //     SaveCHWDataAsImage(out_data, pad_h, pad_w, debug_filename);
-    // }
 }
 
 //def make_inference(I0, I1, n) :
@@ -403,42 +406,70 @@ cv::Mat padImage(const cv::Mat& img, int target_w, int target_h) {
     return padded;
 }
 
-cv::Mat TensorToMat(Ort::Value& tensor, int width, int height) {
-    auto type_info = tensor.GetTypeInfo();
-    auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-    auto shape = tensor_info.GetShape();
+// cv::Mat TensorToMat(Ort::Value& tensor, int width, int height) {
+//     auto type_info = tensor.GetTypeInfo();
+//     auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+//     auto shape = tensor_info.GetShape();
 
-    // 假设输出为 NCHW 格式 [1,3,height,width]
-    int64_t channels = shape[1];
+//     // 假设输出为 NCHW 格式 [1,3,height,width]
+//     int64_t channels = shape[1];
+//     int64_t out_h = shape[2];
+//     int64_t out_w = shape[3];
+
+//     float* data = tensor.GetTensorMutableData<float>();
+
+//     cv::Mat result(out_h, out_w, CV_8UC3);
+//     for (int h = 0; h < out_h; ++h) {
+//         for (int w = 0; w < out_w; ++w) {
+//             float r = data[(0 * channels + 0) * out_h * out_w + h * out_w + w];
+//             float g = data[(0 * channels + 1) * out_h * out_w + h * out_w + w];
+//             float b = data[(0 * channels + 2) * out_h * out_w + h * out_w + w];
+//             // 反归一化 (假设模型输出范围 [0,1])
+//             cv::Vec3b pixel(static_cast<uchar>(b * 255),
+//                 static_cast<uchar>(g * 255),
+//                 static_cast<uchar>(r * 255));
+//             result.at<cv::Vec3b>(h, w) = pixel;
+//         }
+//     }
+//     // 裁剪填充区域 (如果之前做了32对齐)
+//     if (out_h > height || out_w > width) {
+//         result = result(cv::Rect(0, 0, width, height)).clone();
+//     }
+//     return result;
+// }
+
+// 优化版
+cv::Mat TensorToMat(Ort::Value& tensor, int width, int height) {
+    auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
     int64_t out_h = shape[2];
     int64_t out_w = shape[3];
 
     float* data = tensor.GetTensorMutableData<float>();
+    int hw = out_h * out_w;
 
     cv::Mat result(out_h, out_w, CV_8UC3);
+
     for (int h = 0; h < out_h; ++h) {
+        // 取行指针（比 at<> 快 5~10 倍）
+        cv::Vec3b* row = result.ptr<cv::Vec3b>(h);
+
         for (int w = 0; w < out_w; ++w) {
-            float r = data[(0 * channels + 0) * out_h * out_w + h * out_w + w];
-            float g = data[(0 * channels + 1) * out_h * out_w + h * out_w + w];
-            float b = data[(0 * channels + 2) * out_h * out_w + h * out_w + w];
-            // 反归一化 (假设模型输出范围 [0,1])
-            cv::Vec3b pixel(static_cast<uchar>(b * 255),
-                static_cast<uchar>(g * 255),
-                static_cast<uchar>(r * 255));
-            // float b = data[(0 * channels + 0) * out_h * out_w + h * out_w + w];
-            // float g = data[(0 * channels + 1) * out_h * out_w + h * out_w + w];
-            // float r = data[(0 * channels + 2) * out_h * out_w + h * out_w + w];
-            // // OpenCV Mat 存储 BGR
-            // cv::Vec3b pixel(static_cast<uchar>(b * 255),
-            //     static_cast<uchar>(g * 255),
-            //     static_cast<uchar>(r * 255));
-            result.at<cv::Vec3b>(h, w) = pixel;
+            // 极简索引，无冗余计算（和你逻辑完全一致）
+            float r = data[0 * hw + h * out_w + w];
+            float g = data[1 * hw + h * out_w + w];
+            float b = data[2 * hw + h * out_w + w];
+
+            // 直接写入，无任何多余操作
+            row[w][0] = (uchar)(b * 255);
+            row[w][1] = (uchar)(g * 255);
+            row[w][2] = (uchar)(r * 255);
         }
     }
-    // 裁剪填充区域 (如果之前做了32对齐)
+
     if (out_h > height || out_w > width) {
         result = result(cv::Rect(0, 0, width, height)).clone();
     }
+
     return result;
 }
 
@@ -916,221 +947,221 @@ int interpolation(std::string path, std::string modelPath) {
 }
 
 
-class Logger : public ILogger
-{
-    void log(Severity severity, const char* msg) noexcept override
-    {
-        // suppress info-level messages
-        if (severity <= Severity::kWARNING)
-            std::cout << msg << std::endl;
-    }
-} gLogger;
+// class Logger : public ILogger
+// {
+//     void log(Severity severity, const char* msg) noexcept override
+//     {
+//         // suppress info-level messages
+//         if (severity <= Severity::kWARNING)
+//             std::cout << msg << std::endl;
+//     }
+// } gLogger;
 
-std::vector<char> loadFile(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    assert(file.good());
-    return std::vector<char>((std::istreambuf_iterator<char>(file)),
-        std::istreambuf_iterator<char>());
-}
-
-
-class TRTInfer {
-public:
-    TRTInfer(const std::string& enginePath) {
-        auto engineData = loadFile(enginePath);
-        runtime = createInferRuntime(gLogger);
-        engine = runtime->deserializeCudaEngine(engineData.data(), engineData.size());
-        context = engine->createExecutionContext();
-
-        cudaStreamCreate(&stream);
-    }
-    ~TRTInfer() {
-        for (auto& kv : deviceBuffers) {
-            cudaFree(kv.second);
-        }
-        cudaStreamDestroy(stream);
-        context->destroy();
-        engine->destroy();
-        runtime->destroy();
-    }
-
-    void allocate(int batch, int h, int w) {
-        inputShapes["img0"] = Dims4(batch, 3, h, w);
-        inputShapes["img1"] = Dims4(batch, 3, h, w);
-
-        int nb = engine->getNbIOTensors();
-
-        for (int i = 0; i < nb; i++) {
-            const char* name = engine->getIOTensorName(i);
-            auto mode = engine->getTensorIOMode(name);
-
-            if (mode == TensorIOMode::kINPUT) {
-                context->setInputShape(name, inputShapes[name]);
-            }
-        }
-
-        for (int i = 0; i < nb; i++) {
-            const char* name = engine->getIOTensorName(i);
-            auto shape = context->getTensorShape(name);
-
-            int64_t size = 1;
-            for (int j = 0; j < shape.nbDims; j++) {
-                size *= shape.d[j];
-            }
-
-            size_t bytes = size * sizeof(float);
-
-            void* devicePtr;
-            cudaMalloc(&devicePtr, bytes);
-            deviceBuffers[name] = devicePtr;
-
-            // 🔥 关键：绑定 tensor → GPU 地址
-            context->setTensorAddress(name, devicePtr);
-
-            //bindings.push_back(devicePtr);
-
-            shapes[name] = shape;
-        }
-    }
-
-    std::map<std::string, std::vector<float>> infer(std::map<std::string, std::vector<float>>& inputs) {
-        //H2D
-        for (auto& kv : inputs) {
-            cudaMemcpyAsync(deviceBuffers[kv.first],
-                kv.second.data(),
-                kv.second.size() * sizeof(float),
-                cudaMemcpyHostToDevice,
-                stream);
-        }
-
-        //执行
-        context->enqueueV3(stream);
-
-        //D2H
-        std::map<std::string, std::vector<float>> outputs;
-        for (auto& kv : deviceBuffers) {
-            const std::string& name = kv.first;
-            if (engine->getTensorIOMode(name.c_str()) == TensorIOMode::kOUTPUT) {
-                auto shape = shapes[name];
-                int size = 1;
-                for (int i = 0; i < shape.nbDims; i++) {
-                    size *= shape.d[i];
-                }
-                std::vector<float> out(size);
-                cudaMemcpyAsync(out.data(),
-                    kv.second,
-                    size * sizeof(float),
-                    cudaMemcpyDeviceToHost,
-                    stream);
-                outputs[name] = std::move(out);
-            };
-        }
-        cudaStreamSynchronize(stream);
-        return outputs;
-    }
-private:
-    IRuntime* runtime{ nullptr };
-    ICudaEngine* engine{ nullptr };
-    IExecutionContext* context{ nullptr };
-    cudaStream_t stream;
-
-    std::map<std::string, void*> deviceBuffers;
-    std::vector<void*> bindings;
-    std::map<std::string, Dims> shapes;
-    std::map<std::string, Dims> inputShapes;
-};
+// std::vector<char> loadFile(const std::string& path) {
+//     std::ifstream file(path, std::ios::binary);
+//     assert(file.good());
+//     return std::vector<char>((std::istreambuf_iterator<char>(file)),
+//         std::istreambuf_iterator<char>());
+// }
 
 
-int interpolationTensorrt(std::string path, std::string modelPath) {
-    //判断path是否存在
-    if (path.empty()) {
-        std::cerr << "Error: Path is null." << std::endl;
-        return -1;
-    }
+// class TRTInfer {
+// public:
+//     TRTInfer(const std::string& enginePath) {
+//         auto engineData = loadFile(enginePath);
+//         runtime = createInferRuntime(gLogger);
+//         engine = runtime->deserializeCudaEngine(engineData.data(), engineData.size());
+//         context = engine->createExecutionContext();
 
-    std::filesystem::path filePath(path);
+//         cudaStreamCreate(&stream);
+//     }
+//     ~TRTInfer() {
+//         for (auto& kv : deviceBuffers) {
+//             cudaFree(kv.second);
+//         }
+//         cudaStreamDestroy(stream);
+//         context->destroy();
+//         engine->destroy();
+//         runtime->destroy();
+//     }
 
-    if (!std::filesystem::exists(filePath)) {
-        std::cerr << "Error: File does not exist at path: " << path << std::endl;
-        return -1;
-    }
+//     void allocate(int batch, int h, int w) {
+//         inputShapes["img0"] = Dims4(batch, 3, h, w);
+//         inputShapes["img1"] = Dims4(batch, 3, h, w);
 
-    if (!std::filesystem::is_regular_file(filePath)) {
-        std::cerr << "Error: Path is not a regular file: " << path << std::endl;
-        return -1;
-    }
-    std::cout << path << " valid" << std::endl;
+//         int nb = engine->getNbIOTensors();
 
-    std::cout << "video info" << std::endl;
-    // 初始化解码器
-    VideoDecoder decoder(path);
+//         for (int i = 0; i < nb; i++) {
+//             const char* name = engine->getIOTensorName(i);
+//             auto mode = engine->getTensorIOMode(name);
 
-    // 从解码器获取视频信息
-    int width = decoder.GetWidth();
-    int height = decoder.GetHeight();
-    double fps = decoder.GetFPS();
-    int64_t frameCount = decoder.GetFrameCount();
-    double duration = decoder.GetDuration();
-    unsigned int fourcc = decoder.GetFourCC();
-    std::string fourcc_str = decoder.GetFourCCString();
-    // 打印获取到的信息
-    std::cout << "视频基本信息:" << std::endl;
-    std::cout << "帧速率 (FPS): " << fps << std::endl;
-    std::cout << "分辨率: " << width << " x " << height << std::endl;
-    std::cout << "总帧数: " << frameCount << std::endl;
-    std::cout << "时长: " << duration << " s" << std::endl;
-    std::cout << "编码格式 (FOURCC): " << fourcc_str << " (0x" << std::hex << fourcc << std::dec << ")" << std::endl;
-    std::cout << "decoder inited" << std::endl;
+//             if (mode == TensorIOMode::kINPUT) {
+//                 context->setInputShape(name, inputShapes[name]);
+//             }
+//         }
 
-    TRTInfer trt(modelPath);
+//         for (int i = 0; i < nb; i++) {
+//             const char* name = engine->getIOTensorName(i);
+//             auto shape = context->getTensorShape(name);
 
-    int output_width = width;   // 输出视频宽度
-    int output_height = height;  // 输出视频高度
-    VideoEncoder encoder("output_video_tensor.mp4", width, height, fps * 2);
-    int pad_w = ((width + 32 - 1) / 32) * 32;
-    int pad_h = ((height + 32 - 1) / 32) * 32;
+//             int64_t size = 1;
+//             for (int j = 0; j < shape.nbDims; j++) {
+//                 size *= shape.d[j];
+//             }
 
-    std::vector<float> frame_buffers[2];
-    int buf_idx = 0;
-    int frame_count = 0;
-    ULONGLONG start = GetTickCount64();
-    while (decoder.GetNextFrame()) {
-        AVFrame* frame = decoder.GetFrame();
-        auto& curr_buf = frame_buffers[buf_idx];
-        FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
-        if (frame_count > 0) {
-            // 分配显存空间
-            trt.allocate(1, pad_h, pad_w);
-            auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
+//             size_t bytes = size * sizeof(float);
 
-            std::map<std::string, std::vector<float>> inputs = {
-                {"img0", prev_buf},
-                {"img1", curr_buf}
-            };
+//             void* devicePtr;
+//             cudaMalloc(&devicePtr, bytes);
+//             deviceBuffers[name] = devicePtr;
 
-            auto outputs = trt.infer(inputs);
-            auto rgb_frame = VectorToMat(outputs["merged"], pad_w, pad_h, width, height);
+//             // 🔥 关键：绑定 tensor → GPU 地址
+//             context->setTensorAddress(name, devicePtr);
 
-            encoder.WriteFrame(rgb_frame);
-        }
-        // 切换缓冲区索引，复用两块内存。 当前的 curr_buf 变成上一帧的数据
-        buf_idx = (buf_idx + 1) % 2;
-        frame_count++;
-    }
-    // 写入最后一帧
-    if (frame_count > 0) {
-        // 最后一帧结束时，下标被切换到了下一块缓冲区， 最后一帧的缓冲区在相对位置
-        int last_buf_idx = (buf_idx + 1) % 2;
-        auto& last_buf = frame_buffers[last_buf_idx];
+//             //bindings.push_back(devicePtr);
 
-        cv::Mat last_frame = VectorToMat(last_buf, pad_w, pad_h, width, height);
-        encoder.WriteFrame(last_frame);
-    }
-    std::cout << "Total frames processed: " << frame_count << std::endl;
-    ULONGLONG end = GetTickCount64();
-    std::cout << "耗时: " << (end - start) << " 毫秒" << std::endl;
-    return 0;
-}
+//             shapes[name] = shape;
+//         }
+//     }
+
+//     std::map<std::string, std::vector<float>> infer(std::map<std::string, std::vector<float>>& inputs) {
+//         //H2D
+//         for (auto& kv : inputs) {
+//             cudaMemcpyAsync(deviceBuffers[kv.first],
+//                 kv.second.data(),
+//                 kv.second.size() * sizeof(float),
+//                 cudaMemcpyHostToDevice,
+//                 stream);
+//         }
+
+//         //执行
+//         context->enqueueV3(stream);
+
+//         //D2H
+//         std::map<std::string, std::vector<float>> outputs;
+//         for (auto& kv : deviceBuffers) {
+//             const std::string& name = kv.first;
+//             if (engine->getTensorIOMode(name.c_str()) == TensorIOMode::kOUTPUT) {
+//                 auto shape = shapes[name];
+//                 int size = 1;
+//                 for (int i = 0; i < shape.nbDims; i++) {
+//                     size *= shape.d[i];
+//                 }
+//                 std::vector<float> out(size);
+//                 cudaMemcpyAsync(out.data(),
+//                     kv.second,
+//                     size * sizeof(float),
+//                     cudaMemcpyDeviceToHost,
+//                     stream);
+//                 outputs[name] = std::move(out);
+//             };
+//         }
+//         cudaStreamSynchronize(stream);
+//         return outputs;
+//     }
+// private:
+//     IRuntime* runtime{ nullptr };
+//     ICudaEngine* engine{ nullptr };
+//     IExecutionContext* context{ nullptr };
+//     cudaStream_t stream;
+
+//     std::map<std::string, void*> deviceBuffers;
+//     std::vector<void*> bindings;
+//     std::map<std::string, Dims> shapes;
+//     std::map<std::string, Dims> inputShapes;
+// };
+
+
+// int interpolationTensorrt(std::string path, std::string modelPath) {
+//     //判断path是否存在
+//     if (path.empty()) {
+//         std::cerr << "Error: Path is null." << std::endl;
+//         return -1;
+//     }
+
+//     std::filesystem::path filePath(path);
+
+//     if (!std::filesystem::exists(filePath)) {
+//         std::cerr << "Error: File does not exist at path: " << path << std::endl;
+//         return -1;
+//     }
+
+//     if (!std::filesystem::is_regular_file(filePath)) {
+//         std::cerr << "Error: Path is not a regular file: " << path << std::endl;
+//         return -1;
+//     }
+//     std::cout << path << " valid" << std::endl;
+
+//     std::cout << "video info" << std::endl;
+//     // 初始化解码器
+//     VideoDecoder decoder(path);
+
+//     // 从解码器获取视频信息
+//     int width = decoder.GetWidth();
+//     int height = decoder.GetHeight();
+//     double fps = decoder.GetFPS();
+//     int64_t frameCount = decoder.GetFrameCount();
+//     double duration = decoder.GetDuration();
+//     unsigned int fourcc = decoder.GetFourCC();
+//     std::string fourcc_str = decoder.GetFourCCString();
+//     // 打印获取到的信息
+//     std::cout << "视频基本信息:" << std::endl;
+//     std::cout << "帧速率 (FPS): " << fps << std::endl;
+//     std::cout << "分辨率: " << width << " x " << height << std::endl;
+//     std::cout << "总帧数: " << frameCount << std::endl;
+//     std::cout << "时长: " << duration << " s" << std::endl;
+//     std::cout << "编码格式 (FOURCC): " << fourcc_str << " (0x" << std::hex << fourcc << std::dec << ")" << std::endl;
+//     std::cout << "decoder inited" << std::endl;
+
+//     TRTInfer trt(modelPath);
+
+//     int output_width = width;   // 输出视频宽度
+//     int output_height = height;  // 输出视频高度
+//     VideoEncoder encoder("output_video_tensor.mp4", width, height, fps * 2);
+//     int pad_w = ((width + 32 - 1) / 32) * 32;
+//     int pad_h = ((height + 32 - 1) / 32) * 32;
+
+//     std::vector<float> frame_buffers[2];
+//     int buf_idx = 0;
+//     int frame_count = 0;
+//     ULONGLONG start = GetTickCount64();
+//     while (decoder.GetNextFrame()) {
+//         AVFrame* frame = decoder.GetFrame();
+//         auto& curr_buf = frame_buffers[buf_idx];
+//         FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
+//         if (frame_count > 0) {
+//             // 分配显存空间
+//             trt.allocate(1, pad_h, pad_w);
+//             auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
+
+//             std::map<std::string, std::vector<float>> inputs = {
+//                 {"img0", prev_buf},
+//                 {"img1", curr_buf}
+//             };
+
+//             auto outputs = trt.infer(inputs);
+//             auto rgb_frame = VectorToMat(outputs["merged"], pad_w, pad_h, width, height);
+
+//             encoder.WriteFrame(rgb_frame);
+//         }
+//         // 切换缓冲区索引，复用两块内存。 当前的 curr_buf 变成上一帧的数据
+//         buf_idx = (buf_idx + 1) % 2;
+//         frame_count++;
+//     }
+//     // 写入最后一帧
+//     if (frame_count > 0) {
+//         // 最后一帧结束时，下标被切换到了下一块缓冲区， 最后一帧的缓冲区在相对位置
+//         int last_buf_idx = (buf_idx + 1) % 2;
+//         auto& last_buf = frame_buffers[last_buf_idx];
+
+//         cv::Mat last_frame = VectorToMat(last_buf, pad_w, pad_h, width, height);
+//         encoder.WriteFrame(last_frame);
+//     }
+//     std::cout << "Total frames processed: " << frame_count << std::endl;
+//     ULONGLONG end = GetTickCount64();
+//     std::cout << "耗时: " << (end - start) << " 毫秒" << std::endl;
+//     return 0;
+// }
 
 int main()
 {
