@@ -21,6 +21,10 @@ extern "C" {
 #include <fstream>
 #include <cuda_runtime.h>
 
+// openvino
+#include <openvino/openvino.hpp>
+#include <openvino/opsets/opset9.hpp>
+
 using namespace nvinfer1;
 
 /**
@@ -1120,6 +1124,9 @@ int interpolationTensorrt(std::string path, std::string modelPath) {
     VideoEncoder encoder("output_video_tensor.mp4", width, height, fps * 2);
     int pad_w = ((width + 32 - 1) / 32) * 32;
     int pad_h = ((height + 32 - 1) / 32) * 32;
+    
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    std::vector<int64_t> dims = { 1, 3, pad_h, pad_w };
 
     std::vector<float> frame_buffers[2];
     int buf_idx = 0;
@@ -1133,6 +1140,17 @@ int interpolationTensorrt(std::string path, std::string modelPath) {
             // 分配显存空间
             trt.allocate(1, pad_h, pad_w);
             auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
+            Ort::Value prev_tensor = Ort::Value::CreateTensor<float>(
+                    memory_info,
+                    prev_buf.data(),
+                    prev_buf.size(),
+                    dims.data(),
+                    dims.size()
+                    );
+
+
+            cv::Mat last_frame = TensorToMat(prev_tensor, width, height);
+            encoder.WriteFrame(last_frame);
 
             std::map<std::string, std::vector<float>> inputs = {
                 {"img0", prev_buf},
@@ -1163,13 +1181,235 @@ int interpolationTensorrt(std::string path, std::string modelPath) {
     return 0;
 }
 
+
+class OpenvinoInfer {
+public:
+    OpenvinoInfer(const std::string& modelPath, int pad_w, int pad_h) {
+        // Step 1. Initialize OpenVINO Runtime core
+        // ov::Core 是 OpenVINO 管理底层硬件缓存、GPU Context 和执行插件的核心对象， 必须类私有，不能局部变量
+        // ov::Core core;
+        // -------------------------------------------------------------------
+        // Step 2. Read a model
+        std::cout << "Loading model files: " << modelPath << std::endl;
+        model = core.read_model(modelPath);
+        
+        std::cout << "Number of outputs: " << model->outputs().size() << std::endl;
+        // for (size_t i = 0; i < model->outputs().size(); ++i) {
+        //     std::cout << "Output " << i << ": " << model->output(i).get_any_name() 
+        //               << " shape: " << model->output(i).get_shape() << std::endl;
+        // }
+        //printInputAndOutputsInfo(*model);
+        // Step 3. Validate model inputs and outputs
+        OPENVINO_ASSERT(model->inputs().size() == 2, "Sample supports models with 2 inputs only");
+        OPENVINO_ASSERT(model->outputs().size() == 3, "Sample supports models with 3 outputs only");
+        // Step 6. Configure model preprocessing
+        const ov::Layout tensor_layout{ "NHWC" };
+        // clang-format off
+        ov::preprocess::PrePostProcessor ppp = ov::preprocess::PrePostProcessor(model);
+        // 1) input() with no args assumes a model has a single input
+        //ov::preprocess::InputInfo& input_info = ppp.input();
+        auto& input0 = ppp.input(0);
+        auto& input1 = ppp.input(1);
+        // 2) Set input tensor information:
+        // - precision of tensor is supposed to be 'u8'
+        // - layout of data is 'NHWC'
+        // 外部已经进行了前处理的过程，这里只用告诉模型输入的数据类型和结构就行了
+        // 1. 设置输入张量类型为 F32，布局为 NCHW
+        input0.tensor()
+            .set_element_type(ov::element::f32)
+            .set_layout("NCHW");
+        input1.tensor()
+            .set_element_type(ov::element::f32)
+            .set_layout("NCHW");
+        // 2. 设置模型期望的布局也是 NCHW (通常模型定义里就是 NCHW)
+        // 如果模型定义里是 NCHW，这里可以省略，但显式声明更安全
+        input0.model().set_layout("NCHW");
+        input1.model().set_layout("NCHW");
+        // 5) output () with no args assumes a model has a single output
+        // 有几个输出就需要设置几个
+        for (size_t i = 0; i < model->outputs().size(); ++i) {
+            auto& out = ppp.output(i);
+            out.tensor().set_element_type(ov::element::f32);
+            // 如果有 layout 需求可以加（通常不需要）
+            // out.tensor().set_layout("NCHW");
+        }
+
+
+        // 设置输入 shape
+        model->reshape({
+            {model->input(0).get_any_name(), ov::Shape{1, 3, static_cast<size_t>(pad_h), static_cast<size_t>(pad_w)}},
+            {model->input(1).get_any_name(), ov::Shape{1, 3, static_cast<size_t>(pad_h), static_cast<size_t>(pad_w)}}
+        });
+
+        // 7) Apply preprocessing modifying the original 'model'
+        model = ppp.build();
+        // -------------------------------------------------------------------
+        // Step 7. Loading a model to the device
+        compiled_model = core.compile_model(model, "AUTO:GPU,CPU"); // 无inter显卡的话自动降级到CPU
+        std::cout << "compiled outputs: " << compiled_model.outputs().size() << std::endl;
+        //todo 获取当前使用的设备信息
+        // -------------------------------------------------------------------
+        // Step 8. Create an infer request
+        infer_request = compiled_model.create_infer_request();
+
+    }
+    // 智能对象，生命周期结束会自动释放
+    //~OpenvinoInfer() {
+    //    compiled_model = ov::CompiledModel(); // 清空
+    //    infer_request = ov::InferRequest();
+    //}
+
+    void infer(const float* img0_data, const float* img1_data, std::vector<float>& output_vec) {
+        // 1. 从请求中获取输入 Tensor (这些 Tensor 由 OpenVINO 内部管理内存)
+        ov::Tensor input_tensor_0 = infer_request.get_input_tensor(0);
+        ov::Tensor input_tensor_1 = infer_request.get_input_tensor(1);
+
+        // 显式设置当前推理帧的 Shape，确保 get_byte_size() 安全且准确
+        // input_tensor_0.set_shape({1, 3, static_cast<size_t>(pad_h), static_cast<size_t>(pad_w)});
+        // input_tensor_1.set_shape({1, 3, static_cast<size_t>(pad_h), static_cast<size_t>(pad_w)});
+        
+        // 3. 拷贝数据到 OpenVINO 管理的内存中
+        // 注意：memcpy 比逐元素赋值快得多
+        std::cout << input_tensor_0.get_byte_size() << std::endl;
+        std::memcpy(input_tensor_0.data<float>(), img0_data, input_tensor_0.get_byte_size());
+        std::memcpy(input_tensor_1.data<float>(), img1_data, input_tensor_1.get_byte_size());
+
+
+        // Step 10. Do inference synchronously
+        infer_request.infer();
+        // [flow, mask, merged]
+        ov::Tensor output_tensor = infer_request.get_output_tensor(2);
+
+        // 6. 拷贝输出数据到用户提供的 vector
+        size_t elem_count = output_tensor.get_size();
+        output_vec.resize(elem_count);
+        std::memcpy(output_vec.data(), output_tensor.data<const float>(), output_tensor.get_byte_size());
+    }
+private:
+    ov::Core core;
+    std::shared_ptr<ov::Model> model;
+    ov::CompiledModel compiled_model;
+    ov::InferRequest infer_request;
+};
+
+int interprolationVino(std::string path, std::string modelPath) {
+
+    //判断path是否存在
+    if (path.empty()) {
+        std::cerr << "Error: Path is null." << std::endl;
+        return -1;
+    }
+
+    std::filesystem::path filePath(path);
+
+    if (!std::filesystem::exists(filePath)) {
+        std::cerr << "Error: File does not exist at path: " << path << std::endl;
+        return -1;
+    }
+
+    if (!std::filesystem::is_regular_file(filePath)) {
+        std::cerr << "Error: Path is not a regular file: " << path << std::endl;
+        return -1;
+    }
+    std::cout << path << " valid" << std::endl;
+
+    std::cout << "video info" << std::endl;
+    // 初始化解码器
+    VideoDecoder decoder(path);
+
+    // 从解码器获取视频信息
+    int width = decoder.GetWidth();
+    int height = decoder.GetHeight();
+    double fps = decoder.GetFPS();
+    int64_t frameCount = decoder.GetFrameCount();
+    double duration = decoder.GetDuration();
+    unsigned int fourcc = decoder.GetFourCC();
+    std::string fourcc_str = decoder.GetFourCCString();
+    // 打印获取到的信息
+    std::cout << "视频基本信息:" << std::endl;
+    std::cout << "帧速率 (FPS): " << fps << std::endl;
+    std::cout << "分辨率: " << width << " x " << height << std::endl;
+    std::cout << "总帧数: " << frameCount << std::endl;
+    std::cout << "时长: " << duration << " s" << std::endl;
+    std::cout << "编码格式 (FOURCC): " << fourcc_str << " (0x" << std::hex << fourcc << std::dec << ")" << std::endl;
+    std::cout << "decoder inited" << std::endl;
+
+    int pad_w = ((width + 32 - 1) / 32) * 32;
+    int pad_h = ((height + 32 - 1) / 32) * 32;
+
+    OpenvinoInfer vino(modelPath, pad_w, pad_h);
+
+    int output_width = width;   // 输出视频宽度
+    int output_height = height;  // 输出视频高度
+    VideoEncoder encoder("output_video_tensor.mp4", width, height, fps * 2);
+
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    std::vector<int64_t> dims = { 1, 3, pad_h, pad_w };
+
+    std::vector<float> frame_buffers[2];
+    int buf_idx = 0;
+    int frame_count = 0;
+    ULONGLONG start = GetTickCount64();
+    while (decoder.GetNextFrame()) {
+        AVFrame* frame = decoder.GetFrame();
+        auto& curr_buf = frame_buffers[buf_idx];
+        FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
+        if (frame_count > 0) {
+            auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
+            Ort::Value prev_tensor = Ort::Value::CreateTensor<float>(
+                    memory_info,
+                    prev_buf.data(),
+                    prev_buf.size(),
+                    dims.data(),
+                    dims.size()
+                    );
+
+
+            cv::Mat last_frame = TensorToMat(prev_tensor, width, height);
+            encoder.WriteFrame(last_frame);
+
+            // 不会拷贝数据， 指向prev_buf.data()的指针
+            // GPU插件可能会有异步读取数据的风险，虽然这里是同步调用。因此先放弃从外部构建ov::tensor
+            // ov::Tensor img0(ov::element::f32, { 1, 3, static_cast<unsigned long long>(pad_h), static_cast<unsigned long long>(pad_w) }, prev_buf.data());
+            // ov::Tensor img1(ov::element::f32, { 1, 3, static_cast<unsigned long long>(pad_h), static_cast<unsigned long long>(pad_w) }, curr_buf.data());
+            // auto outputs = vino.infer(img0, img1);
+            std::vector<float> result_vector;
+            vino.infer(prev_buf.data(), curr_buf.data(), result_vector);
+            auto rgb_frame = VectorToMat(result_vector, pad_w, pad_h, width, height);
+
+            encoder.WriteFrame(rgb_frame);
+        }
+        // 切换缓冲区索引，复用两块内存。 当前的 curr_buf 变成上一帧的数据
+        buf_idx = (buf_idx + 1) % 2;
+        frame_count++;
+    }
+    // 写入最后一帧
+    if (frame_count > 0) {
+        // 最后一帧结束时，下标被切换到了下一块缓冲区， 最后一帧的缓冲区在相对位置
+        int last_buf_idx = (buf_idx + 1) % 2;
+        auto& last_buf = frame_buffers[last_buf_idx];
+
+        cv::Mat last_frame = VectorToMat(last_buf, pad_w, pad_h, width, height);
+        encoder.WriteFrame(last_frame);
+    }
+    std::cout << "Total frames processed: " << frame_count << std::endl;
+    ULONGLONG end = GetTickCount64();
+    std::cout << "耗时: " << (end - start) << " 毫秒" << std::endl;
+    return 0;
+}
+
 int main()
 {
     //onnx dml
-    int res = interpolation("./demo5s.mp4", "./flownet.onnx");
+    //int res = interpolation("./demo5s.mp4", "./flownet.onnx");
 
     //tensor
     //int res = interpolationTensorrt("./demo5s.mp4", "./flownet.engine");
+    // 
+    
+    //openvino
+    int res = interprolationVino("./demo5s.mp4", "./flownet.xml");
+
     // 
     //TRTInfer trt("flownet.engine");
 

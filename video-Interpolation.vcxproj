@@ -117,13 +117,13 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;CV_IGNORE_DEBUG_BUILD_GUARD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>%CUDA_PATH_V11_8%/include;%TENSORRT_INCLUDE_8_6%;include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>%OPENVINO_INCLUDE%;%CUDA_PATH_V11_8%/include;%TENSORRT_INCLUDE_8_6%;include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>%CUDA_PATH_V11_8%/lib/x64;%TENSORRT_LIB_8_6%;lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avcodec.lib;avdevice.lib;avfilter.lib;avformat.lib;avutil.lib;postproc.lib;swresample.lib;swscale.lib;onnxruntime.lib;opencv_world4130.lib;DirectML.lib;nvinfer.lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>%OPENVINO_LIB_DEBUG%;%CUDA_PATH_V11_8%/lib/x64;%TENSORRT_LIB_8_6%;lib</AdditionalLibraryDirectories>
+      <AdditionalDependencies>avcodec.lib;avdevice.lib;avfilter.lib;avformat.lib;avutil.lib;postproc.lib;swresample.lib;swscale.lib;onnxruntime.lib;opencv_world4130.lib;DirectML.lib;nvinfer.lib;cudart.lib;openvinod.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
