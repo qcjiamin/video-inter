@@ -16,12 +16,12 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <videoEncoder.h>
 #include <videoDecoder.h>
-//tensorRT
-// #include <NvInfer.h>
-// #include <fstream>
-// #include <cuda_runtime.h>
+// tensorRT
+#include <NvInfer.h>
+#include <fstream>
+#include <cuda_runtime.h>
 
-// using namespace nvinfer1;
+using namespace nvinfer1;
 
 /**
  * 列出当前 FFmpeg 库中所有的解码器
@@ -947,221 +947,221 @@ int interpolation(std::string path, std::string modelPath) {
 }
 
 
-// class Logger : public ILogger
-// {
-//     void log(Severity severity, const char* msg) noexcept override
-//     {
-//         // suppress info-level messages
-//         if (severity <= Severity::kWARNING)
-//             std::cout << msg << std::endl;
-//     }
-// } gLogger;
+class Logger : public ILogger
+{
+    void log(Severity severity, const char* msg) noexcept override
+    {
+        // suppress info-level messages
+        if (severity <= Severity::kWARNING)
+            std::cout << msg << std::endl;
+    }
+} gLogger;
 
-// std::vector<char> loadFile(const std::string& path) {
-//     std::ifstream file(path, std::ios::binary);
-//     assert(file.good());
-//     return std::vector<char>((std::istreambuf_iterator<char>(file)),
-//         std::istreambuf_iterator<char>());
-// }
-
-
-// class TRTInfer {
-// public:
-//     TRTInfer(const std::string& enginePath) {
-//         auto engineData = loadFile(enginePath);
-//         runtime = createInferRuntime(gLogger);
-//         engine = runtime->deserializeCudaEngine(engineData.data(), engineData.size());
-//         context = engine->createExecutionContext();
-
-//         cudaStreamCreate(&stream);
-//     }
-//     ~TRTInfer() {
-//         for (auto& kv : deviceBuffers) {
-//             cudaFree(kv.second);
-//         }
-//         cudaStreamDestroy(stream);
-//         context->destroy();
-//         engine->destroy();
-//         runtime->destroy();
-//     }
-
-//     void allocate(int batch, int h, int w) {
-//         inputShapes["img0"] = Dims4(batch, 3, h, w);
-//         inputShapes["img1"] = Dims4(batch, 3, h, w);
-
-//         int nb = engine->getNbIOTensors();
-
-//         for (int i = 0; i < nb; i++) {
-//             const char* name = engine->getIOTensorName(i);
-//             auto mode = engine->getTensorIOMode(name);
-
-//             if (mode == TensorIOMode::kINPUT) {
-//                 context->setInputShape(name, inputShapes[name]);
-//             }
-//         }
-
-//         for (int i = 0; i < nb; i++) {
-//             const char* name = engine->getIOTensorName(i);
-//             auto shape = context->getTensorShape(name);
-
-//             int64_t size = 1;
-//             for (int j = 0; j < shape.nbDims; j++) {
-//                 size *= shape.d[j];
-//             }
-
-//             size_t bytes = size * sizeof(float);
-
-//             void* devicePtr;
-//             cudaMalloc(&devicePtr, bytes);
-//             deviceBuffers[name] = devicePtr;
-
-//             // 🔥 关键：绑定 tensor → GPU 地址
-//             context->setTensorAddress(name, devicePtr);
-
-//             //bindings.push_back(devicePtr);
-
-//             shapes[name] = shape;
-//         }
-//     }
-
-//     std::map<std::string, std::vector<float>> infer(std::map<std::string, std::vector<float>>& inputs) {
-//         //H2D
-//         for (auto& kv : inputs) {
-//             cudaMemcpyAsync(deviceBuffers[kv.first],
-//                 kv.second.data(),
-//                 kv.second.size() * sizeof(float),
-//                 cudaMemcpyHostToDevice,
-//                 stream);
-//         }
-
-//         //执行
-//         context->enqueueV3(stream);
-
-//         //D2H
-//         std::map<std::string, std::vector<float>> outputs;
-//         for (auto& kv : deviceBuffers) {
-//             const std::string& name = kv.first;
-//             if (engine->getTensorIOMode(name.c_str()) == TensorIOMode::kOUTPUT) {
-//                 auto shape = shapes[name];
-//                 int size = 1;
-//                 for (int i = 0; i < shape.nbDims; i++) {
-//                     size *= shape.d[i];
-//                 }
-//                 std::vector<float> out(size);
-//                 cudaMemcpyAsync(out.data(),
-//                     kv.second,
-//                     size * sizeof(float),
-//                     cudaMemcpyDeviceToHost,
-//                     stream);
-//                 outputs[name] = std::move(out);
-//             };
-//         }
-//         cudaStreamSynchronize(stream);
-//         return outputs;
-//     }
-// private:
-//     IRuntime* runtime{ nullptr };
-//     ICudaEngine* engine{ nullptr };
-//     IExecutionContext* context{ nullptr };
-//     cudaStream_t stream;
-
-//     std::map<std::string, void*> deviceBuffers;
-//     std::vector<void*> bindings;
-//     std::map<std::string, Dims> shapes;
-//     std::map<std::string, Dims> inputShapes;
-// };
+std::vector<char> loadFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    assert(file.good());
+    return std::vector<char>((std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+}
 
 
-// int interpolationTensorrt(std::string path, std::string modelPath) {
-//     //判断path是否存在
-//     if (path.empty()) {
-//         std::cerr << "Error: Path is null." << std::endl;
-//         return -1;
-//     }
+class TRTInfer {
+public:
+    TRTInfer(const std::string& enginePath) {
+        auto engineData = loadFile(enginePath);
+        runtime = createInferRuntime(gLogger);
+        engine = runtime->deserializeCudaEngine(engineData.data(), engineData.size());
+        context = engine->createExecutionContext();
 
-//     std::filesystem::path filePath(path);
+        cudaStreamCreate(&stream);
+    }
+    ~TRTInfer() {
+        for (auto& kv : deviceBuffers) {
+            cudaFree(kv.second);
+        }
+        cudaStreamDestroy(stream);
+        context->destroy();
+        engine->destroy();
+        runtime->destroy();
+    }
 
-//     if (!std::filesystem::exists(filePath)) {
-//         std::cerr << "Error: File does not exist at path: " << path << std::endl;
-//         return -1;
-//     }
+    void allocate(int batch, int h, int w) {
+        inputShapes["img0"] = Dims4(batch, 3, h, w);
+        inputShapes["img1"] = Dims4(batch, 3, h, w);
 
-//     if (!std::filesystem::is_regular_file(filePath)) {
-//         std::cerr << "Error: Path is not a regular file: " << path << std::endl;
-//         return -1;
-//     }
-//     std::cout << path << " valid" << std::endl;
+        int nb = engine->getNbIOTensors();
 
-//     std::cout << "video info" << std::endl;
-//     // 初始化解码器
-//     VideoDecoder decoder(path);
+        for (int i = 0; i < nb; i++) {
+            const char* name = engine->getIOTensorName(i);
+            auto mode = engine->getTensorIOMode(name);
 
-//     // 从解码器获取视频信息
-//     int width = decoder.GetWidth();
-//     int height = decoder.GetHeight();
-//     double fps = decoder.GetFPS();
-//     int64_t frameCount = decoder.GetFrameCount();
-//     double duration = decoder.GetDuration();
-//     unsigned int fourcc = decoder.GetFourCC();
-//     std::string fourcc_str = decoder.GetFourCCString();
-//     // 打印获取到的信息
-//     std::cout << "视频基本信息:" << std::endl;
-//     std::cout << "帧速率 (FPS): " << fps << std::endl;
-//     std::cout << "分辨率: " << width << " x " << height << std::endl;
-//     std::cout << "总帧数: " << frameCount << std::endl;
-//     std::cout << "时长: " << duration << " s" << std::endl;
-//     std::cout << "编码格式 (FOURCC): " << fourcc_str << " (0x" << std::hex << fourcc << std::dec << ")" << std::endl;
-//     std::cout << "decoder inited" << std::endl;
+            if (mode == TensorIOMode::kINPUT) {
+                context->setInputShape(name, inputShapes[name]);
+            }
+        }
 
-//     TRTInfer trt(modelPath);
+        for (int i = 0; i < nb; i++) {
+            const char* name = engine->getIOTensorName(i);
+            auto shape = context->getTensorShape(name);
 
-//     int output_width = width;   // 输出视频宽度
-//     int output_height = height;  // 输出视频高度
-//     VideoEncoder encoder("output_video_tensor.mp4", width, height, fps * 2);
-//     int pad_w = ((width + 32 - 1) / 32) * 32;
-//     int pad_h = ((height + 32 - 1) / 32) * 32;
+            int64_t size = 1;
+            for (int j = 0; j < shape.nbDims; j++) {
+                size *= shape.d[j];
+            }
 
-//     std::vector<float> frame_buffers[2];
-//     int buf_idx = 0;
-//     int frame_count = 0;
-//     ULONGLONG start = GetTickCount64();
-//     while (decoder.GetNextFrame()) {
-//         AVFrame* frame = decoder.GetFrame();
-//         auto& curr_buf = frame_buffers[buf_idx];
-//         FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
-//         if (frame_count > 0) {
-//             // 分配显存空间
-//             trt.allocate(1, pad_h, pad_w);
-//             auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
+            size_t bytes = size * sizeof(float);
 
-//             std::map<std::string, std::vector<float>> inputs = {
-//                 {"img0", prev_buf},
-//                 {"img1", curr_buf}
-//             };
+            void* devicePtr;
+            cudaMalloc(&devicePtr, bytes);
+            deviceBuffers[name] = devicePtr;
 
-//             auto outputs = trt.infer(inputs);
-//             auto rgb_frame = VectorToMat(outputs["merged"], pad_w, pad_h, width, height);
+            // 🔥 关键：绑定 tensor → GPU 地址
+            context->setTensorAddress(name, devicePtr);
 
-//             encoder.WriteFrame(rgb_frame);
-//         }
-//         // 切换缓冲区索引，复用两块内存。 当前的 curr_buf 变成上一帧的数据
-//         buf_idx = (buf_idx + 1) % 2;
-//         frame_count++;
-//     }
-//     // 写入最后一帧
-//     if (frame_count > 0) {
-//         // 最后一帧结束时，下标被切换到了下一块缓冲区， 最后一帧的缓冲区在相对位置
-//         int last_buf_idx = (buf_idx + 1) % 2;
-//         auto& last_buf = frame_buffers[last_buf_idx];
+            //bindings.push_back(devicePtr);
 
-//         cv::Mat last_frame = VectorToMat(last_buf, pad_w, pad_h, width, height);
-//         encoder.WriteFrame(last_frame);
-//     }
-//     std::cout << "Total frames processed: " << frame_count << std::endl;
-//     ULONGLONG end = GetTickCount64();
-//     std::cout << "耗时: " << (end - start) << " 毫秒" << std::endl;
-//     return 0;
-// }
+            shapes[name] = shape;
+        }
+    }
+
+    std::map<std::string, std::vector<float>> infer(std::map<std::string, std::vector<float>>& inputs) {
+        //H2D
+        for (auto& kv : inputs) {
+            cudaMemcpyAsync(deviceBuffers[kv.first],
+                kv.second.data(),
+                kv.second.size() * sizeof(float),
+                cudaMemcpyHostToDevice,
+                stream);
+        }
+
+        //执行
+        context->enqueueV3(stream);
+
+        //D2H
+        std::map<std::string, std::vector<float>> outputs;
+        for (auto& kv : deviceBuffers) {
+            const std::string& name = kv.first;
+            if (engine->getTensorIOMode(name.c_str()) == TensorIOMode::kOUTPUT) {
+                auto shape = shapes[name];
+                int size = 1;
+                for (int i = 0; i < shape.nbDims; i++) {
+                    size *= shape.d[i];
+                }
+                std::vector<float> out(size);
+                cudaMemcpyAsync(out.data(),
+                    kv.second,
+                    size * sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream);
+                outputs[name] = std::move(out);
+            };
+        }
+        cudaStreamSynchronize(stream);
+        return outputs;
+    }
+private:
+    IRuntime* runtime{ nullptr };
+    ICudaEngine* engine{ nullptr };
+    IExecutionContext* context{ nullptr };
+    cudaStream_t stream;
+
+    std::map<std::string, void*> deviceBuffers;
+    std::vector<void*> bindings;
+    std::map<std::string, Dims> shapes;
+    std::map<std::string, Dims> inputShapes;
+};
+
+
+int interpolationTensorrt(std::string path, std::string modelPath) {
+    //判断path是否存在
+    if (path.empty()) {
+        std::cerr << "Error: Path is null." << std::endl;
+        return -1;
+    }
+
+    std::filesystem::path filePath(path);
+
+    if (!std::filesystem::exists(filePath)) {
+        std::cerr << "Error: File does not exist at path: " << path << std::endl;
+        return -1;
+    }
+
+    if (!std::filesystem::is_regular_file(filePath)) {
+        std::cerr << "Error: Path is not a regular file: " << path << std::endl;
+        return -1;
+    }
+    std::cout << path << " valid" << std::endl;
+
+    std::cout << "video info" << std::endl;
+    // 初始化解码器
+    VideoDecoder decoder(path);
+
+    // 从解码器获取视频信息
+    int width = decoder.GetWidth();
+    int height = decoder.GetHeight();
+    double fps = decoder.GetFPS();
+    int64_t frameCount = decoder.GetFrameCount();
+    double duration = decoder.GetDuration();
+    unsigned int fourcc = decoder.GetFourCC();
+    std::string fourcc_str = decoder.GetFourCCString();
+    // 打印获取到的信息
+    std::cout << "视频基本信息:" << std::endl;
+    std::cout << "帧速率 (FPS): " << fps << std::endl;
+    std::cout << "分辨率: " << width << " x " << height << std::endl;
+    std::cout << "总帧数: " << frameCount << std::endl;
+    std::cout << "时长: " << duration << " s" << std::endl;
+    std::cout << "编码格式 (FOURCC): " << fourcc_str << " (0x" << std::hex << fourcc << std::dec << ")" << std::endl;
+    std::cout << "decoder inited" << std::endl;
+
+    TRTInfer trt(modelPath);
+
+    int output_width = width;   // 输出视频宽度
+    int output_height = height;  // 输出视频高度
+    VideoEncoder encoder("output_video_tensor.mp4", width, height, fps * 2);
+    int pad_w = ((width + 32 - 1) / 32) * 32;
+    int pad_h = ((height + 32 - 1) / 32) * 32;
+
+    std::vector<float> frame_buffers[2];
+    int buf_idx = 0;
+    int frame_count = 0;
+    ULONGLONG start = GetTickCount64();
+    while (decoder.GetNextFrame()) {
+        AVFrame* frame = decoder.GetFrame();
+        auto& curr_buf = frame_buffers[buf_idx];
+        FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
+        if (frame_count > 0) {
+            // 分配显存空间
+            trt.allocate(1, pad_h, pad_w);
+            auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
+
+            std::map<std::string, std::vector<float>> inputs = {
+                {"img0", prev_buf},
+                {"img1", curr_buf}
+            };
+
+            auto outputs = trt.infer(inputs);
+            auto rgb_frame = VectorToMat(outputs["merged"], pad_w, pad_h, width, height);
+
+            encoder.WriteFrame(rgb_frame);
+        }
+        // 切换缓冲区索引，复用两块内存。 当前的 curr_buf 变成上一帧的数据
+        buf_idx = (buf_idx + 1) % 2;
+        frame_count++;
+    }
+    // 写入最后一帧
+    if (frame_count > 0) {
+        // 最后一帧结束时，下标被切换到了下一块缓冲区， 最后一帧的缓冲区在相对位置
+        int last_buf_idx = (buf_idx + 1) % 2;
+        auto& last_buf = frame_buffers[last_buf_idx];
+
+        cv::Mat last_frame = VectorToMat(last_buf, pad_w, pad_h, width, height);
+        encoder.WriteFrame(last_frame);
+    }
+    std::cout << "Total frames processed: " << frame_count << std::endl;
+    ULONGLONG end = GetTickCount64();
+    std::cout << "耗时: " << (end - start) << " 毫秒" << std::endl;
+    return 0;
+}
 
 int main()
 {
