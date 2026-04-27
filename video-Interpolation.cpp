@@ -708,6 +708,123 @@ void SaveTensorAsImage(const Ort::Value& tensor, int pad_h, int pad_w, const std
     }
 }
 
+class DmlInfer{
+public:
+    DmlInfer(std::string modelPath): 
+        session{nullptr},
+        memory_info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
+        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "VideoInterpolation");
+
+        const OrtApi& ortApi = Ort::GetApi();
+        const void* dmlApi_ptr = nullptr;
+
+        // 创建会话
+        Ort::SessionOptions session_options;
+        session_options.SetIntraOpNumThreads(1);
+        session_options.SetInterOpNumThreads(1);
+        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        session_options.DisableMemPattern();
+        session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+
+        OrtStatus* status = ortApi.GetExecutionProviderApi("DML", ORT_API_VERSION, &dmlApi_ptr);
+        if (status == nullptr && dmlApi_ptr != nullptr) {
+            auto dmlApi = reinterpret_cast<const OrtDmlApi*>(dmlApi_ptr);
+            auto re = dmlApi->SessionOptionsAppendExecutionProvider_DML(session_options, 0);
+            if (re != nullptr) {
+                const char* msg = ortApi.GetErrorMessage(re);
+                // 此处可以打印日志，说明为什么 DML 失败了
+                std::cerr << "Error: Failed to set DML execution provider. Reason: " << msg << std::endl;
+                ortApi.ReleaseStatus(re);
+                // 回退回cpu执行，继续创建session
+                // return -1;
+                session_options.AppendExecutionProvider_CPU(1);
+                //todo 开启cpu算子内的多线程
+                session_options.SetIntraOpNumThreads(0);
+                session_options.SetInterOpNumThreads(0);
+            }
+            else {
+                std::cout << "use dml" << std::endl;
+            }
+        }
+
+        std::wstring widestr = std::wstring(modelPath.begin(), modelPath.end());
+        session = Ort::Session(env, widestr.c_str(), session_options);
+        // 打印模型输入信息
+        printModelInputInfo(session);
+
+        // 输入输出字段名获取
+        Ort::AllocatorWithDefaultOptions allocator;
+        // auto input_name0 = session.GetInputNameAllocated(0, allocator);
+        // auto input_name1 = session.GetInputNameAllocated(1, allocator);
+        // auto output_name0 = session.GetOutputNameAllocated(0, allocator);
+        // auto output_name1 = session.GetOutputNameAllocated(1, allocator);
+        // auto output_name2 = session.GetOutputNameAllocated(2, allocator);
+        // input_names[] = { input_name0.get(), input_name1.get() };
+        // output_names[] = { output_name0.get(), output_name1.get(),output_name2.get(), };
+        // input
+        size_t input_count = session.GetInputCount();
+        for (size_t i = 0; i < input_count; i++) {
+            auto name = session.GetInputNameAllocated(i, allocator);
+            input_name_strs.push_back(name.get());
+        }
+
+        for (auto& s : input_name_strs) {
+            input_names.push_back(s.c_str());
+        }
+
+        // output
+        size_t output_count = session.GetOutputCount();
+        for (size_t i = 0; i < output_count; i++) {
+            auto name = session.GetOutputNameAllocated(i, allocator);
+            output_name_strs.push_back(name.get());
+        }
+
+        for (auto& s : output_name_strs) {
+            output_names.push_back(s.c_str());
+        }
+        // 无默认构造函数，在初始化列表里构造
+        // memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        // 外部传入
+        dims = { 1, 3, 1920, 1080 };
+        input_tensors.reserve(2); // 预分配空间，提升性能
+    }
+    Ort::Value infer(Ort::Value& I0, Ort::Value& I1) {
+        // 清空并重新添加输入张量
+        input_tensors.clear();
+        // 使用 std::move 转移所有权，避免拷贝。 外部定义局部变量，这里可以直接转移
+        // todo 工程化里外部是否定义为可以转移的局部变量是未知的，需要修改
+        input_tensors.push_back(std::move(I0));
+        input_tensors.push_back(std::move(I1));
+        // 获取指向 vector 内部数据的指针，类型为 Ort::Value*
+        Ort::Value* input_tensors_ptr = input_tensors.data();
+        auto results = session.Run(
+            Ort::RunOptions{ nullptr },
+            input_names.data(),
+            input_tensors_ptr,   // 注意这里传入的是指针数组，每个元素是 Ort::Value*
+            input_names.size(),
+            // 2,
+            output_names.data(),
+            // 3
+            output_names.size()
+        );
+        // 获取输出张量数据
+        // auto output_tensor = results[2];
+        // return output_tensor;
+        return std::move(results[2]); // 直接转移返回，避免拷贝
+    }
+private:
+    Ort::Session session;
+
+    std::vector<std::string> input_name_strs;
+    std::vector<const char*> input_names;
+
+    std::vector<std::string> output_name_strs;
+    std::vector<const char*> output_names;
+    Ort::MemoryInfo memory_info;
+    std::vector<int64_t> dims;
+    std::vector<Ort::Value> input_tensors;
+};
+
 //实现一个方法，输入视频地址，输出插帧后的视频
 int interpolation(std::string path, std::string modelPath) {
     list_all_decoders();
