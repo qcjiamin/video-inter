@@ -788,15 +788,72 @@ public:
         dims = { 1, 3, height, width };
         input_tensors.reserve(2); // 预分配空间，提升性能
     }
-    Ort::Value infer(Ort::Value& I0, Ort::Value& I1) {
+
+    // 确保 I0, I1 数据不会在函数内有任何修改
+    std::vector<Ort::Value> infer2(std::vector<float>& I0, std::vector<float>& I1, int n) {
+        auto tenser0 = CreateTensor(I0.data(), I0.size());
+        auto tenser1 = CreateTensor(I1.data(), I1.size());
+        std::vector<Ort::Value> input_tensors2;
+        // Ort::Value 禁止拷贝, 其内部移除了 拷贝构造函数
+        // std::vector::push_back会调用 拷贝构造函数 ，因此需要使用 std::move 来转移所有权，避免编译错误
+        // 使用std::move, vector 会调用 移动构造函数
+        input_tensors2.push_back(std::move(tenser0));
+        input_tensors2.push_back(std::move(tenser1));
+        Ort::Value* input_tensors_ptr = input_tensors2.data();
+
+        auto results = session.Run(
+            Ort::RunOptions{ nullptr },
+            input_names.data(),
+            input_tensors_ptr,   // 注意这里传入的是指针数组，每个元素是 Ort::Value*
+            input_names.size(),
+            output_names.data(),
+            output_names.size()
+        );
+        auto middle = std::move(results[2]);
+
+        if(n == 1){
+            std::vector<Ort::Value> out;
+            // out.push_back(std::move(results[2])); // 编译器无法对容器内的特定元素应用返回值优化（RVO/NRVO）
+            out.push_back(std::move(middle));
+            return out;
+        }
+        //todo 这里会发生一次拷贝, 目前没有找到更优解
+        // float* data = middle.GetTensorData<float>();
+        const float* middle_data = middle.GetTensorData<float>();
+        size_t middle_size = middle.GetTensorTypeAndShapeInfo().GetElementCount();
+        std::vector<float> middle_vec(middle_data, middle_data + middle_size);
+        
+        auto left = infer2(I0, middle_vec, n / 2);
+        auto right = infer2(middle_vec, I1, n / 2);
+        
+        std::vector<Ort::Value> out;
+        out.reserve(left.size() + right.size() + (n % 2 ? 1 : 0));
+
+        for(auto& v : left){
+            out.push_back(std::move(v));
+        }
+        if(n % 2){
+            out.push_back(std::move(middle));
+        }
+        for(auto& v : right){
+            out.push_back(std::move(v));
+        }
+
+        return out;
+    }
+    Ort::Value infer(Ort::Value& I0, Ort::Value& I1, int n) {
         // 清空并重新添加输入张量
         input_tensors.clear();
         // 使用 std::move 转移所有权，避免拷贝。 外部定义局部变量，这里可以直接转移
         // todo 工程化里外部是否定义为可以转移的局部变量是未知的，需要修改
+        // Ort::Value 禁止拷贝, 其内部移除了 拷贝构造函数
+        // std::vector::push_back会调用 拷贝构造函数 ，因此需要使用 std::move 来转移所有权，避免编译错误
+        // 使用std::move, vector 会调用 移动构造函数
         input_tensors.push_back(std::move(I0));
         input_tensors.push_back(std::move(I1));
         // 获取指向 vector 内部数据的指针，类型为 Ort::Value*
         Ort::Value* input_tensors_ptr = input_tensors.data();
+
         auto results = session.Run(
             Ort::RunOptions{ nullptr },
             input_names.data(),
@@ -807,9 +864,6 @@ public:
             // 3
             output_names.size()
         );
-        // 获取输出张量数据
-        // auto output_tensor = results[2];
-        // return output_tensor;
         return std::move(results[2]); // 编译器无法对容器内的特定元素应用返回值优化（RVO/NRVO）
     }
     Ort::Value CreateTensor(float* data, size_t size) {
@@ -834,6 +888,141 @@ private:
     std::vector<int64_t> dims;
     std::vector<Ort::Value> input_tensors;
 };
+// 递归调用版
+int interpolationDml_recursion(std::string path, std::string modelPath){
+    int tofps = 60;
+    //判断path是否存在
+    if (path.empty()) {
+        std::cerr << "Error: Path is null." << std::endl;
+        return -1;
+    }
+
+    std::filesystem::path filePath(path);
+
+    if (!std::filesystem::exists(filePath)) {
+        std::cerr << "Error: File does not exist at path: " << path << std::endl;
+        return -1;
+    }
+
+    if (!std::filesystem::is_regular_file(filePath)) {
+        std::cerr << "Error: Path is not a regular file: " << path << std::endl;
+        return -1;
+    }
+    std::cout << path << " valid" << std::endl;
+
+    try {
+
+        std::cout << "video info" << std::endl;
+        // 初始化解码器
+        VideoDecoder decoder(path);
+
+        // 从解码器获取视频信息
+        int width = decoder.GetWidth();
+        int height = decoder.GetHeight();
+        double fps = decoder.GetFPS();
+        int64_t frameCount = decoder.GetFrameCount();
+        double duration = decoder.GetDuration();
+        unsigned int fourcc = decoder.GetFourCC();
+        std::string fourcc_str = decoder.GetFourCCString();
+
+        // 打印获取到的信息
+        std::cout << "视频基本信息:" << std::endl;
+        std::cout << "帧速率 (FPS): " << fps << std::endl;
+        std::cout << "分辨率: " << width << " x " << height << std::endl;
+        std::cout << "总帧数: " << frameCount << std::endl;
+        std::cout << "时长: " << duration << " s" << std::endl;
+        std::cout << "编码格式 (FOURCC): " << fourcc_str << " (0x" << std::hex << fourcc << std::dec << ")" << std::endl;
+
+        // 要插入的帧数
+        int insert_frames = frameCount / fps * tofps - frameCount;
+        int gap_num = frameCount - 1; // 插帧间隔数量
+        float avg_insert = static_cast<float>(insert_frames) / gap_num; // 间隔平均插入帧数
+
+        std::vector<int> insert_counts(gap_num, 0);
+        // 误差累计法分配插帧数量，保证总插帧数正确且分布均匀
+        float error = 0.f;
+
+        for (int i = 0; i < gap_num; ++i)
+        {
+            error += avg_insert;
+            int add = static_cast<int>(std::floor(error)); // 本间隔需要插入的帧数，取整数部分
+            insert_counts[i] = add;
+            error -= add;
+        }
+
+        std::cout << "decoder inited" << std::endl;
+
+        // 初始化ort
+        std::cout << "Initializing ONNX Runtime..." << std::endl;
+        // 需要填充到的宽度
+        int pad_w = ((width + 32 - 1) / 32) * 32;
+        int pad_h = ((height + 32 - 1) / 32) * 32;
+
+        DmlInfer dmlInfer(modelPath, pad_w, pad_h);
+
+        // 初始化视频写入器
+        VideoEncoder encoder("output_video_bydml.mp4", width, height, tofps);
+
+        // 循环调用拉取数据和推理
+        int frame_count = 0;
+
+        std::vector<float> frame_buffers[2]; 
+        int buf_idx = 0;
+
+        ULONGLONG start = GetTickCount64();
+        
+        while (decoder.GetNextFrame()) {
+            AVFrame* frame = decoder.GetFrame();
+
+            auto& curr_buf = frame_buffers[buf_idx];
+            FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
+            
+            auto curr_tensor = dmlInfer.CreateTensor(curr_buf.data(), curr_buf.size());
+
+
+            if (frame_count > 0) {
+                auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
+                //todo 为了统一使用TensorToMat创建插入帧，在类中放出了 CreateTensor接口。 应该可以使用buf直接构建Mat
+                auto prev_tensor = dmlInfer.CreateTensor(prev_buf.data(), prev_buf.size());
+                cv::Mat last_frame = TensorToMat(prev_tensor, width, height);
+                encoder.WriteFrame(last_frame);
+                // 插入帧数
+                int num = insert_counts[frame_count - 1];
+                auto output_tensors = dmlInfer.infer2(prev_buf, curr_buf, num);
+
+                for (auto& output_tensor : output_tensors) {
+                    cv::Mat rgb_frame = TensorToMat(output_tensor, width, height);
+                    encoder.WriteFrame(rgb_frame);
+                }
+            }else{
+                std::cout << "prev_ is null" << std::endl;
+            }
+
+            // 切换缓冲区索引，复用两块内存。 当前的 curr_buf 变成上一帧的数据
+            buf_idx = (buf_idx + 1) % 2;
+            frame_count++;
+        }
+        // 写入最后一帧
+        if(frame_count > 0){
+            // 最后一帧结束时，下标被切换到了下一块缓冲区， 最后一帧的缓冲区在相对位置
+            int last_buf_idx = (buf_idx + 1) % 2;
+            auto& last_buf = frame_buffers[last_buf_idx];
+            
+            auto last_tensor = dmlInfer.CreateTensor(last_buf.data(), last_buf.size());
+            cv::Mat last_frame = TensorToMat(last_tensor, width, height);
+            encoder.WriteFrame(last_frame);
+        }
+
+        std::cout << "Total frames processed: " << frame_count << std::endl;
+        ULONGLONG end = GetTickCount64();
+        std::cout << "use: " << (end - start) << " ms" << std::endl;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error initializing ONNX Runtime: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
 
 int interpolationDml(std::string path, std::string modelPath){
     int tofps = 60;
@@ -879,6 +1068,23 @@ int interpolationDml(std::string path, std::string modelPath){
         std::cout << "时长: " << duration << " s" << std::endl;
         std::cout << "编码格式 (FOURCC): " << fourcc_str << " (0x" << std::hex << fourcc << std::dec << ")" << std::endl;
 
+        // 要插入的帧数
+        int insert_frames = frameCount / fps * tofps - frameCount;
+        int gap_num = frameCount - 1; // 插帧间隔数量
+        float avg_insert = static_cast<float>(insert_frames) / gap_num; // 间隔平均插入帧数
+
+        std::vector<int> insert_counts(gap_num, 0);
+        // 误差累计法分配插帧数量，保证总插帧数正确且分布均匀
+        float error = 0.f;
+
+        for (int i = 0; i < gap_num; ++i)
+        {
+            error += avg_insert;
+            int add = static_cast<int>(std::floor(error)); // 本间隔需要插入的帧数，取整数部分
+            insert_counts[i] = add;
+            error -= add;
+        }
+
         std::cout << "decoder inited" << std::endl;
 
         // 初始化ort
@@ -890,7 +1096,7 @@ int interpolationDml(std::string path, std::string modelPath){
         DmlInfer dmlInfer(modelPath, pad_w, pad_h);
 
         // 初始化视频写入器
-        VideoEncoder encoder("output_video_bydml.mp4", width, height, fps * 2);
+        VideoEncoder encoder("output_video_bydml.mp4", width, height, tofps);
 
         // 循环调用拉取数据和推理
         int frame_count = 0;
@@ -915,8 +1121,9 @@ int interpolationDml(std::string path, std::string modelPath){
                 auto prev_tensor = dmlInfer.CreateTensor(prev_buf.data(), prev_buf.size());
                 cv::Mat last_frame = TensorToMat(prev_tensor, width, height);
                 encoder.WriteFrame(last_frame);
-
-                auto output_tensor = dmlInfer.infer(prev_tensor, curr_tensor);
+                // 插入帧数
+                int num = insert_counts[frame_count - 1];
+                auto output_tensor = dmlInfer.infer(prev_tensor, curr_tensor, num);
                 cv::Mat rgb_frame = TensorToMat(output_tensor, width, height);
 
                 encoder.WriteFrame(rgb_frame);
@@ -1641,7 +1848,8 @@ int interprolationVino(std::string path, std::string modelPath) {
 
 int main()
 {
-    int res = interpolationDml("./demo5s.mp4", "./flownet.onnx");
+    int res = interpolationDml_recursion("./demo5s.mp4", "./flownet.onnx");
+    // int res = interpolationDml("./demo5s.mp4", "./flownet.onnx");
 
     //onnx dml
     //int res = interpolation("./demo5s.mp4", "./flownet.onnx");
