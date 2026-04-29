@@ -9,11 +9,10 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
 }
 #include <vector>
 #include <opencv2/opencv.hpp>
-#include <libswscale/swscale.h>
-#include <libavutil/imgutils.h>
 #include <videoEncoder.h>
 #include <videoDecoder.h>
 // tensorRT
@@ -26,6 +25,84 @@ extern "C" {
 #include <openvino/opsets/opset9.hpp>
 
 using namespace nvinfer1;
+
+double compute_ssim_rgb_f32(
+    const cv::Mat& img1,
+    const cv::Mat& img2,
+    int window = 4, // 局部窗口大小, 每次用8x8的块计算一次SSIM 4-8 8-11 16+
+    int step = 1    // 步长, 1 2 4 8 step 越小 → 采样越密 → 越精确 → 越慢. 外部图片缩小了再对比的，这里把值设小一点
+) {
+    CV_Assert(img1.type() == CV_32FC3);
+    CV_Assert(img2.type() == CV_32FC3);
+    CV_Assert(img1.size() == img2.size());
+
+    const int width  = img1.cols;
+    const int height = img1.rows;
+
+    // 对应 [0,1] 范围
+    const double C1 = (0.01 * 1.0) * (0.01 * 1.0);
+    const double C2 = (0.03 * 1.0) * (0.03 * 1.0);
+
+    double ssim_sum = 0.0;
+    int count = 0;
+
+    for (int y = 0; y <= height - window; y += step) {
+        for (int x = 0; x <= width - window; x += step) {
+
+            // 每个通道分别统计
+            double ssim_c[3] = {0, 0, 0};
+
+            for (int c = 0; c < 3; c++) {
+                double sum_x = 0, sum_y = 0;
+                double sum_x2 = 0, sum_y2 = 0, sum_xy = 0;
+
+                for (int j = 0; j < window; j++) {
+                    const cv::Vec3f* row1 = img1.ptr<cv::Vec3f>(y + j);
+                    const cv::Vec3f* row2 = img2.ptr<cv::Vec3f>(y + j);
+
+                    for (int i = 0; i < window; i++) {
+                        float a = row1[x + i][c];
+                        float b = row2[x + i][c];
+
+                        sum_x  += a;
+                        sum_y  += b;
+                        sum_x2 += a * a;
+                        sum_y2 += b * b;
+                        sum_xy += a * b;
+                    }
+                }
+
+                const int N = window * window;
+
+                double mu_x = sum_x / N;
+                double mu_y = sum_y / N;
+
+                double sigma_x2 = sum_x2 / N - mu_x * mu_x;
+                double sigma_y2 = sum_y2 / N - mu_y * mu_y;
+                double sigma_xy = sum_xy / N - mu_x * mu_y;
+
+                double numerator =
+                    (2 * mu_x * mu_y + C1) *
+                    (2 * sigma_xy + C2);
+
+                double denominator =
+                    (mu_x * mu_x + mu_y * mu_y + C1) *
+                    (sigma_x2 + sigma_y2 + C2);
+
+                ssim_c[c] = numerator / denominator;
+            }
+
+            // 三通道平均
+            double ssim = (ssim_c[0] + ssim_c[1] + ssim_c[2]) / 3.0;
+
+            ssim_sum += ssim;
+            count++;
+        }
+    }
+
+    if (count == 0) return 1.0;
+    return ssim_sum / count;
+}
 
 /**
  * 列出当前 FFmpeg 库中所有的解码器
@@ -289,10 +366,134 @@ void SaveCHWDataAsImage(const std::vector<float>& data, int pad_h, int pad_w, co
     }
 }
 
+cv::Mat FrameToMat(SwsContext* sws_ctx, AVFrame* frame) {
+    // 原始尺寸
+    int src_w = frame->width;
+    int src_h = frame->height;
+    // 初始化格式转换上下文 (YUV420P -> RGB24)，保持原始尺寸，不缩放
+    //SwsContext* sws_ctx = sws_getContext(
+    //    src_w, src_h, (AVPixelFormat)frame->format,
+    //    src_w, src_h, AV_PIX_FMT_RGB24,
+    //    SWS_BILINEAR, nullptr, nullptr, nullptr
+    //);
+    if (!sws_ctx) {
+        throw std::runtime_error("Cannot initialize SwsContext");
+    }
+    // 4. 分配存储 RGB 数据的缓冲区（原始尺寸）
+    cv::Mat rgb_frame(src_h, src_w, CV_8UC3);
+
+    // 5. 准备转换所需的指针
+    uint8_t* dest_data[1] = { rgb_frame.data };
+    int dest_linesize[1] = { src_w * 3 };
+
+    // 6. 执行像素格式转换（YUV -> RGB）
+    sws_scale(sws_ctx, frame->data, frame->linesize, 0, src_h,
+        dest_data, dest_linesize);
+    sws_freeContext(sws_ctx);
+
+    // 归一化
+    cv::Mat fp32;
+    rgb_frame.convertTo(fp32, CV_32F, 1.0f / 255.0f);
+    return fp32;
+}
+
 // ==================== 辅助函数：将 AVFrame 转换为填充后的 RGB 数据（存入 vector<float>）====================
 // 输入：frame - 解码后的视频帧
 // 输出：out_data - 存储 CHW 格式、归一化 [0,1] 的 float 数据，大小 = 3 * pad_h * pad_w
 // 返回：填充后的宽度 pad_w 和高度 pad_h
+cv::Mat FrameToPaddedRgbMat(SwsContext* sws_ctx, AVFrame* frame, int pad_w, int pad_h) {
+    //// 1. 原始尺寸
+    int src_w = frame->width;
+    int src_h = frame->height;
+
+    //// 2. 计算填充后的尺寸（32 的倍数）
+    //int align = 32;
+    //pad_w = ((src_w + align - 1) / align) * align;
+    //pad_h = ((src_h + align - 1) / align) * align;
+
+    // 3. 初始化格式转换上下文 (YUV420P -> RGB24)，保持原始尺寸，不缩放
+    //SwsContext* sws_ctx = sws_getContext(
+    //    src_w, src_h, (AVPixelFormat)frame->format,
+    //    src_w, src_h, AV_PIX_FMT_RGB24,
+    //    SWS_BILINEAR, nullptr, nullptr, nullptr
+    //);
+    if (!sws_ctx) {
+        throw std::runtime_error("Cannot initialize SwsContext");
+    }
+
+    // 4. 分配存储 RGB 数据的缓冲区（原始尺寸）
+    cv::Mat rgb_frame(src_h, src_w, CV_8UC3);
+
+    // 5. 准备转换所需的指针
+    uint8_t* dest_data[1] = { rgb_frame.data };
+    int dest_linesize[1] = { src_w * 3 };
+
+    // 6. 执行像素格式转换（YUV -> RGB）
+    sws_scale(sws_ctx, frame->data, frame->linesize, 0, src_h,
+        dest_data, dest_linesize);
+    // sws_freeContext(sws_ctx);
+
+    // 创建填充后的图像（pad_h x pad_w，黑色背景）
+    //cv::Mat padded_frame(pad_h, pad_w, CV_8UC3, cv::Scalar(0, 0, 0));
+    //rgb_frame.copyTo(padded_frame(cv::Rect(0, 0, src_w, src_h)));
+    // 优化：创建填充黑图，然后将原图拷贝到黑图左上角
+    //Padding (使用 OpenCV copyMakeBorder，比手动创建 Mat + copyTo 更快且内存连续)
+    cv::Mat padded_frame;
+    cv::copyMakeBorder(rgb_frame, padded_frame, 0, pad_h - src_h, 0, pad_w - src_w, 
+                       cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+
+    // 调整 out_data 大小并填充数据 (CHW, float [0,1])
+    // out_data.resize(3 * pad_h * pad_w);
+    // for (int h = 0; h < pad_h; ++h) {
+    //     for (int w = 0; w < pad_w; ++w) {
+    //         cv::Vec3b pixel = padded_frame.at<cv::Vec3b>(h, w);
+    //         float r = pixel[0] / 255.0f;
+    //         float g = pixel[1] / 255.0f;
+    //         float b = pixel[2] / 255.0f;
+
+    //         // CHW 索引
+    //         out_data[(0 * pad_h + h) * pad_w + w] = r;
+    //         out_data[(1 * pad_h + h) * pad_w + w] = g;
+    //         out_data[(2 * pad_h + h) * pad_w + w] = b;
+    //     }
+    // }
+    // 优化： Normalize & Convert to CHW Float (关键优化点)
+    // 避免逐像素循环，使用 OpenCV 批量操作
+    //out_data.resize(size_t(3) * pad_h * pad_w);
+    //float* dst = out_data.data();
+
+    //const size_t channel_size = size_t(pad_h) * pad_w;
+    cv::Mat fp32;
+    padded_frame.convertTo(fp32, CV_32F, 1.0f / 255.0f);
+    return fp32;
+
+    //for (int y = 0; y < pad_h; y++) {
+    //    const cv::Vec3f* ptr = fp32.ptr<cv::Vec3f>(y);
+    //    for (int x = 0; x < pad_w; x++) {
+    //        auto pix = ptr[x];
+    //        dst[channel_size * 0 + y * pad_w + x] = pix[0]; // R
+    //        dst[channel_size * 1 + y * pad_w + x] = pix[1]; // G
+    //        dst[channel_size * 2 + y * pad_w + x] = pix[2]; // B
+    //    }
+    //}
+}
+// 将frame 转换为的 cv::Mat 转为 vector<float>
+void matToVector(cv::Mat& mat, std::vector<float>& out_data, int pad_w, int pad_h) {
+    out_data.resize(size_t(3) * pad_h * pad_w);
+    float* dst = out_data.data();
+
+    const size_t channel_size = size_t(pad_h) * pad_w;
+    for (int y = 0; y < pad_h; y++) {
+        const cv::Vec3f* ptr = mat.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < pad_w; x++) {
+            auto pix = ptr[x];
+            dst[channel_size * 0 + y * pad_w + x] = pix[0]; // R
+            dst[channel_size * 1 + y * pad_w + x] = pix[1]; // G
+            dst[channel_size * 2 + y * pad_w + x] = pix[2]; // B
+        }
+    }
+}
+
 void FrameToPaddedRGBVector(AVFrame* frame, std::vector<float>& out_data, int pad_w, int pad_h) {
     //// 1. 原始尺寸
     int src_w = frame->width;
@@ -331,8 +532,8 @@ void FrameToPaddedRGBVector(AVFrame* frame, std::vector<float>& out_data, int pa
     // 优化：创建填充黑图，然后将原图拷贝到黑图左上角
     //Padding (使用 OpenCV copyMakeBorder，比手动创建 Mat + copyTo 更快且内存连续)
     cv::Mat padded_frame;
-    cv::copyMakeBorder(rgb_frame, padded_frame, 0, pad_h - src_h, 0, pad_w - src_w, 
-                       cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    cv::copyMakeBorder(rgb_frame, padded_frame, 0, pad_h - src_h, 0, pad_w - src_w,
+        cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
 
     // 调整 out_data 大小并填充数据 (CHW, float [0,1])
     // out_data.resize(3 * pad_h * pad_w);
@@ -368,7 +569,6 @@ void FrameToPaddedRGBVector(AVFrame* frame, std::vector<float>& out_data, int pa
         }
     }
 }
-
 //def make_inference(I0, I1, n) :
 //    global model
 //    middle = model.inference(I0, I1, args.scale)
@@ -712,40 +912,41 @@ class DmlInfer{
 public:
     DmlInfer(std::string modelPath, int width, int height) : 
         session{nullptr},
-        memory_info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
-        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "VideoInterpolation");
-
-        const OrtApi& ortApi = Ort::GetApi();
-        const void* dmlApi_ptr = nullptr;
+        memory_info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+        env(ORT_LOGGING_LEVEL_WARNING, "VideoInterpolation"){
+        // Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "VideoInterpolation");
 
         // 创建会话
         Ort::SessionOptions session_options;
-        session_options.SetIntraOpNumThreads(1);
-        session_options.SetInterOpNumThreads(1);
+        session_options.SetIntraOpNumThreads(0);
+        session_options.SetInterOpNumThreads(0);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         session_options.DisableMemPattern();
         session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 
-        OrtStatus* status = ortApi.GetExecutionProviderApi("DML", ORT_API_VERSION, &dmlApi_ptr);
-        if (status == nullptr && dmlApi_ptr != nullptr) {
-            auto dmlApi = reinterpret_cast<const OrtDmlApi*>(dmlApi_ptr);
-            auto re = dmlApi->SessionOptionsAppendExecutionProvider_DML(session_options, 0);
-            if (re != nullptr) {
-                const char* msg = ortApi.GetErrorMessage(re);
-                // 此处可以打印日志，说明为什么 DML 失败了
-                std::cerr << "Error: Failed to set DML execution provider. Reason: " << msg << std::endl;
-                ortApi.ReleaseStatus(re);
-                // 回退回cpu执行，继续创建session
-                // return -1;
-                // session_options.AppendExecutionProvider_CPU(1);
-                //todo 开启cpu算子内的多线程
-                session_options.SetIntraOpNumThreads(0);
-                session_options.SetInterOpNumThreads(0);
-            }
-            else {
-                std::cout << "use dml" << std::endl;
-            }
-        }
+        // 启用 DML
+        // const OrtApi& ortApi = Ort::GetApi();
+        // const void* dmlApi_ptr = nullptr;
+        // OrtStatus* status = ortApi.GetExecutionProviderApi("DML", ORT_API_VERSION, &dmlApi_ptr);
+        // if (status == nullptr && dmlApi_ptr != nullptr) {
+        //     auto dmlApi = reinterpret_cast<const OrtDmlApi*>(dmlApi_ptr);
+        //     auto re = dmlApi->SessionOptionsAppendExecutionProvider_DML(session_options, 0);
+        //     if (re != nullptr) {
+        //         const char* msg = ortApi.GetErrorMessage(re);
+        //         // 此处可以打印日志，说明为什么 DML 失败了
+        //         // std::cerr << "Error: Failed to set DML execution provider. Reason: " << msg << std::endl;
+        //         ortApi.ReleaseStatus(re);
+        //         // 回退回cpu执行，继续创建session
+        //         // return -1;
+        //         // session_options.AppendExecutionProvider_CPU(1);
+        //         //todo 开启cpu算子内的多线程
+        //         session_options.SetIntraOpNumThreads(0);
+        //         session_options.SetInterOpNumThreads(0);
+        //     }
+        //     else {
+        //         std::cout << "use dml" << std::endl;
+        //     }
+        // }
 
         std::wstring widestr = std::wstring(modelPath.begin(), modelPath.end());
         session = Ort::Session(env, widestr.c_str(), session_options);
@@ -878,6 +1079,7 @@ public:
     }
 private:
     Ort::Session session;
+    Ort::Env env; 
 
     std::vector<std::string> input_name_strs;
     std::vector<const char*> input_names;
@@ -888,6 +1090,8 @@ private:
     std::vector<int64_t> dims;
     std::vector<Ort::Value> input_tensors;
 };
+
+
 // 递归调用版
 int interpolationDml_recursion(std::string path, std::string modelPath){
     int tofps = 60;
@@ -909,6 +1113,8 @@ int interpolationDml_recursion(std::string path, std::string modelPath){
         return -1;
     }
     std::cout << path << " valid" << std::endl;
+    // 初始化转换上下文
+    SwsContext* sws_normal_ctx = nullptr;
 
     try {
 
@@ -967,17 +1173,40 @@ int interpolationDml_recursion(std::string path, std::string modelPath){
         int frame_count = 0;
 
         std::vector<float> frame_buffers[2]; 
+        cv::Mat small_buffers[2];  // 保存缩放后的小图数据
         int buf_idx = 0;
 
         ULONGLONG start = GetTickCount64();
         
         while (decoder.GetNextFrame()) {
             AVFrame* frame = decoder.GetFrame();
+            // 解码第一帧后再拿像素格式， AVCodecContext->pix_fmt 或 AVStream->codecpar->format 不一定准确
+            if (sws_normal_ctx == nullptr) {
+                sws_normal_ctx = sws_getCachedContext(
+                    sws_normal_ctx,
+                    width, height, (AVPixelFormat)frame->format,
+                    width, height, AV_PIX_FMT_RGB24,
+                    SWS_BILINEAR,
+                    nullptr, nullptr, nullptr
+                );
+            }
+
+            // frame yuv4 转 cvmat rgb
 
             auto& curr_buf = frame_buffers[buf_idx];
-            FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
+            auto frameMat = FrameToPaddedRgbMat(sws_normal_ctx, frame, pad_w, pad_h);
+
+            double small_w = 32.0;
+            double small_h = pad_h * (small_w / pad_w);
+
+            //cv::Mat curr_small;
+            // cv::Mat curr_small(small_h, small_w, frameMat.type()); // 分配大小，稍微快一点
+            auto& curr_small = small_buffers[buf_idx]; // resize自动创建内存 / 重新分配大小, 不需要初始化
+            cv::resize(frameMat, curr_small, cv::Size(small_w, small_h), 0, 0, cv::INTER_LINEAR);
             
-            auto curr_tensor = dmlInfer.CreateTensor(curr_buf.data(), curr_buf.size());
+            matToVector(frameMat, curr_buf, pad_w, pad_h);
+
+            // auto curr_tensor = dmlInfer.CreateTensor(curr_buf.data(), curr_buf.size());
 
 
             if (frame_count > 0) {
@@ -986,13 +1215,32 @@ int interpolationDml_recursion(std::string path, std::string modelPath){
                 auto prev_tensor = dmlInfer.CreateTensor(prev_buf.data(), prev_buf.size());
                 cv::Mat last_frame = TensorToMat(prev_tensor, width, height);
                 encoder.WriteFrame(last_frame);
+
+                auto& prev_small = small_buffers[(buf_idx + 1) % 2];
+                // cv::Mat ssim_map; // 计算SSIM图
+                // double ssim = cv::quality::QualitySSIM::compute(prev_small, curr_small, ssim_map)[0];
+                double ssim =compute_ssim_rgb_f32(prev_small, curr_small);
                 // 插入帧数
                 int num = insert_counts[frame_count - 1];
-                auto output_tensors = dmlInfer.infer2(prev_buf, curr_buf, num);
-
-                for (auto& output_tensor : output_tensors) {
-                    cv::Mat rgb_frame = TensorToMat(output_tensor, width, height);
-                    encoder.WriteFrame(rgb_frame);
+                if(ssim > 0.996){
+                    std::cout << "same copy" << std::endl;
+                    // 相似度高，直接复制上一帧，减少推理次数
+                    for(int i = 0; i < num; i++){
+                        encoder.WriteFrame(last_frame);
+                    }
+                }else if(ssim < 0.2){
+                    std::cout << "diff copy" << std::endl;
+                    // 相似度极低，直接写入当前帧，减少推理次数
+                    for(int i = 0; i < num; i++){
+                        encoder.WriteFrame(last_frame);
+                    }
+                }else{
+                    // 中等相似度，继续执行插帧推理
+                    auto output_tensors = dmlInfer.infer2(prev_buf, curr_buf, num);
+                    for (auto& output_tensor : output_tensors) {
+                        cv::Mat rgb_frame = TensorToMat(output_tensor, width, height);
+                        encoder.WriteFrame(rgb_frame);
+                    }
                 }
             }else{
                 std::cout << "prev_ is null" << std::endl;
@@ -1018,6 +1266,10 @@ int interpolationDml_recursion(std::string path, std::string modelPath){
         std::cout << "use: " << (end - start) << " ms" << std::endl;
     }
     catch (const std::exception& e) {
+        if (sws_normal_ctx) {
+            sws_freeContext(sws_normal_ctx);
+            sws_normal_ctx = nullptr;
+        }
         std::cerr << "Error initializing ONNX Runtime: " << e.what() << std::endl;
         return -1;
     }
@@ -1113,7 +1365,6 @@ int interpolationDml(std::string path, std::string modelPath){
             FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
             
             auto curr_tensor = dmlInfer.CreateTensor(curr_buf.data(), curr_buf.size());
-
 
             if (frame_count > 0) {
                 auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
@@ -1803,6 +2054,10 @@ int interprolationVino(std::string path, std::string modelPath) {
         auto& curr_buf = frame_buffers[buf_idx];
         FrameToPaddedRGBVector(frame, curr_buf, pad_w, pad_h);
         if (frame_count > 0) {
+
+            // cv::resize(I0_cv, I0_small, cv::Size(32, 32), 0, 0, cv::INTER_LINEAR);
+
+
             auto& prev_buf = frame_buffers[(buf_idx + 1) % 2];
             Ort::Value prev_tensor = Ort::Value::CreateTensor<float>(
                     memory_info,
