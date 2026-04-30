@@ -11,7 +11,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 #include <dml_provider_factory.h>
-#include <onnxruntime_cxx_api.h>
+//#include <onnxruntime_cxx_api.h> util中已经引入了？
 #include "utils.h"
 
 class DmlInfer{
@@ -89,25 +89,59 @@ public:
         dims = { 1, 3, height, width };
         input_tensors.reserve(2); // 预分配空间，提升性能
     }
+    std::vector<cv::Mat> infer_(cv::Mat& frame, int n){
+        int width = frame.cols;
+        int height = frame.rows;
+        // 需要填充到的宽度
+        int pad_w = ((width + 32 - 1) / 32) * 32;
+        int pad_h = ((height + 32 - 1) / 32) * 32;
 
-    // 确保 I0, I1 数据不会在函数内有任何修改
-    std::vector<Ort::Value> infer2(std::vector<float>& I0, std::vector<float>& I1, int n) {
+        double small_w = 32.0;
+        double small_h = pad_h * (small_w / pad_w);
+        //cv::Mat curr_small;
+        // cv::Mat curr_small(small_h, small_w, frameMat.type()); // 分配大小，稍微快一点
+        // auto& curr_small = small_buffers[buf_idx]; // resize自动创建内存 / 重新分配大小, 不需要初始化
+        cv::Mat curr_small;
+        cv::resize(frame, curr_small, cv::Size(small_w, small_h), 0, 0, cv::INTER_LINEAR);
+
         // 第一帧特殊处理，直接返回空，等待下一帧
-        if(I1.empty()){
-            // 假设输入的数据没有被预处理过
-
-            lastBuffer = std::move(I0); // 这样用的话demo的逻辑就不能使用了，因为数据在这里被转移了
-            return std::vector<Ort::Value>{};
+        if(last_buffer.empty()){
+            // 预处理数据, 写入lastBuffer
+            getBufferByMat(frame, last_buffer);
+            last_small = std::move(curr_small);
+            return std::vector<cv::Mat>{};
         }
 
-        
-        // 如果传入的是frame? 每张图片都需要转rgb、chw、归一化、填充
-        // 如果外面已经处理好了，传入的是浮点数数组，即buffer
+        double ssim =compute_ssim_rgb_f32(last_small, curr_small);
+        if(ssim > 0.996){
+            std::vector<cv::Mat> out;
+
+            // 相似度高，直接复制上一帧，减少推理次数
+            for(int i = 0; i < n; i++){
+                std::vector<cv::Mat> out;
+                cv::Mat fp32;
+                fp32.convertTo(frame, CV_32FC3, 1.0f / 255.0f);
+                cv::cvtColor(fp32, fp32, cv::COLOR_BGR2RGB);
+                out.push_back(fp32);
+            }
+        }else if(ssim < 0.2){
+            std::cout << "diff copy" << std::endl;
+            // 相似度极低，直接写入当前帧，减少推理次数
+                std::vector<cv::Mat> out;
+                cv::Mat fp32;
+                fp32.convertTo(frame, CV_32FC3, 1.0f / 255.0f);
+                cv::cvtColor(fp32, fp32, cv::COLOR_BGR2RGB);
+                out.push_back(fp32);
+        }
+
+        // 有lastBuffer, 取currentBuffer
+        std::vector<float> curr_buffer;
+        getBufferByMat(frame, curr_buffer);
         
         // 传入的图片需要做的预处理
         input_tensors.clear();
-        auto tenser0 = CreateTensor(I0.data(), I0.size());
-        auto tenser1 = CreateTensor(I1.data(), I1.size());
+        auto tenser0 = CreateTensor(last_buffer.data(), last_buffer.size());
+        auto tenser1 = CreateTensor(curr_buffer.data(), curr_buffer.size());
         // std::vector<Ort::Value> input_tensors;
         // Ort::Value 禁止拷贝, 其内部移除了 拷贝构造函数
         // std::vector::push_back会调用 拷贝构造函数 ，因此需要使用 std::move 来转移所有权，避免编译错误
@@ -127,9 +161,11 @@ public:
         auto middle = std::move(results[2]);
 
         if(n == 1){
-            std::vector<Ort::Value> out;
+            std::vector<cv::Mat> out;
             // out.push_back(std::move(results[2])); // 编译器无法对容器内的特定元素应用返回值优化（RVO/NRVO）
-            out.push_back(std::move(middle));
+            // out.push_back(std::move(middle));
+            cv::Mat mid_frame = TensorToMat(middle, width, height);
+            out.push_back(std::move(mid_frame));
             return out;
         }
         //todo 这里会发生一次拷贝, 目前没有找到更优解
@@ -137,20 +173,22 @@ public:
         size_t middle_size = middle.GetTensorTypeAndShapeInfo().GetElementCount();
         std::vector<float> middle_vec(middle_data, middle_data + middle_size);
         
-        auto left = infer2(I0, middle_vec, n / 2);
-        auto right = infer2(middle_vec, I1, n / 2);
+        auto left = infer2(last_buffer, middle_vec, n / 2);
+        auto right = infer2(middle_vec, curr_buffer, n / 2);
         
-        std::vector<Ort::Value> out;
+        std::vector<cv::Mat> out;
         out.reserve(left.size() + right.size() + (n % 2 ? 1 : 0));
 
         for(auto& v : left){
-            out.push_back(std::move(v));
+            // 递归里的结果是 Ort::Value, 需要转换成 cv::Mat
+            out.push_back(std::move(TensorToMat(v, width, height)));
         }
         if(n % 2){
-            out.push_back(std::move(middle));
+            cv::Mat mid_frame = TensorToMat(middle, width, height);
+            out.push_back(std::move(mid_frame));
         }
         for(auto& v : right){
-            out.push_back(std::move(v));
+            out.push_back(std::move(TensorToMat(v, width, height)));
         }
 
         return out;
@@ -202,6 +240,59 @@ private:
     Ort::MemoryInfo memory_info;
     std::vector<int64_t> dims;
     std::vector<Ort::Value> input_tensors;
-    std::vector<float> lastBuffer;
-    std::vector<float> lastSmall;
+    std::vector<float> last_buffer;
+    cv::Mat last_small;
+    // 私有递归函数
+    // 确保 I0, I1 数据不会在函数内有任何修改
+    std::vector<Ort::Value> infer2(std::vector<float>& I0, std::vector<float>& I1, int n) {
+        input_tensors.clear();
+        auto tenser0 = CreateTensor(I0.data(), I0.size());
+        auto tenser1 = CreateTensor(I1.data(), I1.size());
+        // std::vector<Ort::Value> input_tensors;
+        // Ort::Value 禁止拷贝, 其内部移除了 拷贝构造函数
+        // std::vector::push_back会调用 拷贝构造函数 ，因此需要使用 std::move 来转移所有权，避免编译错误
+        // 使用std::move, vector 会调用 移动构造函数
+        input_tensors.push_back(std::move(tenser0));
+        input_tensors.push_back(std::move(tenser1));
+        Ort::Value* input_tensors_ptr = input_tensors.data();
+
+        auto results = session.Run(
+            Ort::RunOptions{ nullptr },
+            input_names.data(),
+            input_tensors_ptr,   // 注意这里传入的是指针数组，每个元素是 Ort::Value*
+            input_names.size(),
+            output_names.data(),
+            output_names.size()
+        );
+        auto middle = std::move(results[2]);
+
+        if(n == 1){
+            std::vector<Ort::Value> out;
+            // out.push_back(std::move(results[2])); // 编译器无法对容器内的特定元素应用返回值优化（RVO/NRVO）
+            out.push_back(std::move(middle));
+            return out;
+        }
+        //todo 这里会发生一次拷贝, 目前没有找到更优解
+        const float* middle_data = middle.GetTensorData<float>();
+        size_t middle_size = middle.GetTensorTypeAndShapeInfo().GetElementCount();
+        std::vector<float> middle_vec(middle_data, middle_data + middle_size);
+        
+        auto left = infer2(I0, middle_vec, n / 2);
+        auto right = infer2(middle_vec, I1, n / 2);
+        
+        std::vector<Ort::Value> out;
+        out.reserve(left.size() + right.size() + (n % 2 ? 1 : 0));
+
+        for(auto& v : left){
+            out.push_back(std::move(v));
+        }
+        if(n % 2){
+            out.push_back(std::move(middle));
+        }
+        for(auto& v : right){
+            out.push_back(std::move(v));
+        }
+
+        return out;
+    }
 };
