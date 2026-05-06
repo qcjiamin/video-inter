@@ -207,7 +207,7 @@ void VideoEncoder::WriteFrame(const cv::Mat& bgr_frame) {
     if (bgr_frame.empty() || bgr_frame.cols != width_ || bgr_frame.rows != height_) {
         throw std::runtime_error("Invalid frame size or empty frame");
     }
-    //std::cout << "write frame" << frame_index_ << std::endl;
+    std::cout << "write frame" << frame_index_ << std::endl;
     // 1. 创建 RGB AVFrame
     AVFrame* rgb_avframe = av_frame_alloc();
     if (!rgb_avframe) throw std::runtime_error("Failed to allocate RGB AVFrame");

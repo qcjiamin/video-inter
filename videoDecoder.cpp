@@ -240,7 +240,7 @@ bool VideoDecoder::receive_frame_internal() {
     }
     // 如果启用了硬件加速，且收到的帧是硬件帧，则需要下载到 CPU
     if (is_hw_accel_ && frame_->format == AV_PIX_FMT_D3D11) {
-        std::cout << "HW frame received" << std::endl;
+        // std::cout << "HW frame received" << std::endl;
         // 将硬件帧传输到软件帧。将数据从 GPU 拷贝到 CPU 内存，结果存入 sw_frame_
         ret = av_hwframe_transfer_data(sw_frame_, frame_, 0);
         if (ret < 0) {

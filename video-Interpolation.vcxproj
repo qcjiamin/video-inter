@@ -147,9 +147,6 @@
     <ClCompile Include="videoDecoder.cpp" />
     <ClCompile Include="videoEncoder.cpp" />
   </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="video-interpolation-dml.h" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

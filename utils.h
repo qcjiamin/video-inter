@@ -1,3 +1,4 @@
+#pragma once
 #include <iostream>
 #include <filesystem>
 #include <onnxruntime_cxx_api.h>
@@ -106,7 +107,7 @@ cv::Mat BgrMatToPaddedRgbMat(SwsContext* sws_ctx, AVFrame* frame, int pad_w, int
 // 传入 BGR Mat
 void getBufferByMat(const cv::Mat& bgr, std::vector<float>& out_data) {
     cv::Mat fp32;
-    fp32.convertTo(bgr, CV_32FC3, 1.0f / 255.0f);
+    bgr.convertTo(fp32, CV_32FC3, 1.0f / 255.0f);
     cv::cvtColor(fp32, fp32, cv::COLOR_BGR2RGB);
     cv::Mat padded_frame;
     // 需要填充到的宽度. 每次都重新计算？还是外面传入？
@@ -120,7 +121,7 @@ void getBufferByMat(const cv::Mat& bgr, std::vector<float>& out_data) {
     auto dst = out_data.data();
     const size_t channel_size = size_t(pad_h) * pad_w;
     for (int y = 0; y < pad_h; y++) {
-       const cv::Vec3f* ptr = fp32.ptr<cv::Vec3f>(y);
+       const cv::Vec3f* ptr = padded_frame.ptr<cv::Vec3f>(y);
        for (int x = 0; x < pad_w; x++) {
            auto pix = ptr[x];
            dst[channel_size * 0 + y * pad_w + x] = pix[0]; // R

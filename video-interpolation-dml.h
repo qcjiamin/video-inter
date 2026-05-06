@@ -14,9 +14,9 @@ extern "C" {
 //#include <onnxruntime_cxx_api.h> util中已经引入了？
 #include "utils.h"
 
-class DmlInfer{
+class DmlInfer1{
 public:
-    DmlInfer(std::string modelPath, int width, int height) :
+    DmlInfer1(std::string modelPath) :
         session{nullptr},
         memory_info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
         env(ORT_LOGGING_LEVEL_WARNING, "VideoInterpolation"){
@@ -86,7 +86,7 @@ public:
         }
 
         // 外部传入
-        dims = { 1, 3, height, width };
+        /*dims = { 1, 3, height, width };*/
         input_tensors.reserve(2); // 预分配空间，提升性能
     }
     std::vector<cv::Mat> infer_(cv::Mat& frame, int n){
@@ -95,6 +95,9 @@ public:
         // 需要填充到的宽度
         int pad_w = ((width + 32 - 1) / 32) * 32;
         int pad_h = ((height + 32 - 1) / 32) * 32;
+        if (dims.empty()) {
+            dims = { 1, 3, pad_h, pad_w };
+        }
 
         double small_w = 32.0;
         double small_h = pad_h * (small_w / pad_w);
@@ -103,7 +106,7 @@ public:
         // auto& curr_small = small_buffers[buf_idx]; // resize自动创建内存 / 重新分配大小, 不需要初始化
         cv::Mat curr_small;
         cv::resize(frame, curr_small, cv::Size(small_w, small_h), 0, 0, cv::INTER_LINEAR);
-
+        curr_small.convertTo(curr_small, CV_32FC3, 1.0f / 255.0f);
         // 第一帧特殊处理，直接返回空，等待下一帧
         if(last_buffer.empty()){
             // 预处理数据, 写入lastBuffer
@@ -112,31 +115,51 @@ public:
             return std::vector<cv::Mat>{};
         }
 
-        double ssim =compute_ssim_rgb_f32(last_small, curr_small);
-        if(ssim > 0.996){
-            std::vector<cv::Mat> out;
-
-            // 相似度高，直接复制上一帧，减少推理次数
-            for(int i = 0; i < n; i++){
-                std::vector<cv::Mat> out;
-                cv::Mat fp32;
-                fp32.convertTo(frame, CV_32FC3, 1.0f / 255.0f);
-                cv::cvtColor(fp32, fp32, cv::COLOR_BGR2RGB);
-                out.push_back(fp32);
-            }
-        }else if(ssim < 0.2){
-            std::cout << "diff copy" << std::endl;
-            // 相似度极低，直接写入当前帧，减少推理次数
-                std::vector<cv::Mat> out;
-                cv::Mat fp32;
-                fp32.convertTo(frame, CV_32FC3, 1.0f / 255.0f);
-                cv::cvtColor(fp32, fp32, cv::COLOR_BGR2RGB);
-                out.push_back(fp32);
-        }
-
         // 有lastBuffer, 取currentBuffer
         std::vector<float> curr_buffer;
         getBufferByMat(frame, curr_buffer);
+
+        double ssim =compute_ssim_rgb_f32(last_small, curr_small);
+        if(ssim > 0.996){
+            std::cout << "same copy, return " << n << " frames" << std::endl;
+            std::vector<cv::Mat> out;
+
+            // cv::Mat fp32;
+            // frame.convertTo(fp32, CV_32FC3, 1.0f / 255.0f);
+            // cv::cvtColor(frame, fp32, cv::COLOR_BGR2RGB);
+            out.reserve(n);  // 小优化
+
+            // 相似度高，直接复制上一帧，减少推理次数
+            for(int i = 0; i < n; i++){
+                // cv::Mat fp32;
+                // frame.convertTo(fp32, CV_32FC3, 1.0f / 255.0f);
+                // cv::cvtColor(fp32, fp32, cv::COLOR_BGR2RGB);
+                // out.push_back(std::move(fp32));
+                out.push_back(frame.clone()); // 外面不会修改，只会写入，这里选择不克隆
+            }
+            last_buffer = std::move(curr_buffer);
+            last_small = std::move(curr_small);
+            return out;
+        }else if(ssim < 0.2){
+            std::cout << "diff copy, return " << n << " frames" << std::endl;
+            std::vector<cv::Mat> out;
+            // 相似度极低，直接写入当前帧，减少推理次数
+            // cv::Mat fp32;
+            // frame.convertTo(fp32, CV_32FC3, 1.0f / 255.0f);
+            // cv::cvtColor(frame, fp32, cv::COLOR_BGR2RGB);
+            out.reserve(n);  // 小优化
+            for(int i = 0; i < n; i++){
+                // cv::Mat fp32;
+                // frame.convertTo(fp32, CV_32FC3, 1.0f / 255.0f);
+                // cv::cvtColor(fp32, fp32, cv::COLOR_BGR2RGB);
+                // out.push_back(std::move(fp32));
+                out.push_back(frame.clone());
+            }
+
+            last_buffer = std::move(curr_buffer);
+            last_small = std::move(curr_small);
+            return out;
+        }
         
         // 传入的图片需要做的预处理
         input_tensors.clear();
@@ -162,10 +185,10 @@ public:
 
         if(n == 1){
             std::vector<cv::Mat> out;
-            // out.push_back(std::move(results[2])); // 编译器无法对容器内的特定元素应用返回值优化（RVO/NRVO）
-            // out.push_back(std::move(middle));
             cv::Mat mid_frame = TensorToMat(middle, width, height);
             out.push_back(std::move(mid_frame));
+            last_buffer = std::move(curr_buffer);
+            last_small = std::move(curr_small);
             return out;
         }
         //todo 这里会发生一次拷贝, 目前没有找到更优解
@@ -190,6 +213,9 @@ public:
         for(auto& v : right){
             out.push_back(std::move(TensorToMat(v, width, height)));
         }
+
+        last_buffer = std::move(curr_buffer);
+        last_small = std::move(curr_small);
 
         return out;
     }
@@ -227,6 +253,42 @@ public:
             dims.data(),
             dims.size()
         );
+    }
+
+    cv::Mat getLastBuffer(int width, int height){
+        if(last_buffer.empty()){
+            return cv::Mat();
+        }
+
+        int64_t out_h = dims[2];
+        int64_t out_w = dims[3];
+
+        int hw = out_h * out_w;
+
+        cv::Mat result(out_h, out_w, CV_8UC3);
+
+        for (int h = 0; h < out_h; ++h) {
+            // 取行指针（比 at<> 快 5~10 倍）
+            cv::Vec3b* row = result.ptr<cv::Vec3b>(h);
+
+            for (int w = 0; w < out_w; ++w) {
+                // 极简索引，无冗余计算（和你逻辑完全一致）
+                float r = last_buffer[0 * hw + h * out_w + w];
+                float g = last_buffer[1 * hw + h * out_w + w];
+                float b = last_buffer[2 * hw + h * out_w + w];
+
+                // 直接写入，无任何多余操作
+                row[w][0] = (uchar)(b * 255);
+                row[w][1] = (uchar)(g * 255);
+                row[w][2] = (uchar)(r * 255);
+            }
+        }
+
+        if (out_h > height || out_w > width) {
+            result = result(cv::Rect(0, 0, width, height)).clone();
+        }
+
+        return result;
     }
 private:
     Ort::Session session;

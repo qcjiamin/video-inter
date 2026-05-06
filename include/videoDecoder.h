@@ -1,3 +1,4 @@
+#pragma once
 #include <string>
 extern "C" {
 #include <libavformat/avformat.h>
